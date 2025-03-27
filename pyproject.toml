@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "pip>=21.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipper-sparse"
+version = "0.1.0"
+description = "A prototypical version of CLIPPER that solves the SDP more efficiently"
+readme = "README.md"
+requires-python = "==3.8.*"
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pybind11",
+    "open3d",
+    "mosek",
+    "cvxpy",
+    "pip",
+]
+
+[tool.setuptools]
+packages = ["src"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "mypy",
+    "black",
+    "isort"
+]
