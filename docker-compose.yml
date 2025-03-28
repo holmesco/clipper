@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  clipper_dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: clipper_dev
+    network_mode: host
+    volumes:
+      - ./:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - $HOME/.Xauthority:/root/.Xauthority:rw
+    shm_size: 1g
+    environment:
+      - DISPLAY=$DISPLAY
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    stdin_open: true
+    tty: true
+    
+    # Keep container running indefinitely
+    command: tail -f /dev/null

@@ -17,6 +17,8 @@ dependencies = [
     "open3d",
     "mosek",
     "cvxpy",
+    "cvxopt",
+    "chompack",
     "pip",
 ]
 

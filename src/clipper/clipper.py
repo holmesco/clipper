@@ -8,6 +8,9 @@ import cvxpy as cp
 import mosek.fusion as fu
 import scipy.sparse as sp
 import clipperpy
+from cvxopt import amd, spmatrix
+import chompack
+
 
 
 
@@ -28,9 +31,11 @@ class ConsistencyGraphProb():
         self.clipper = clipperpy.CLIPPER(invariant, params)
         # Get pairwise consistency matrix
         self.clipper.score_pairwise_consistency(points_1, points_2, associations)
-
         # Init affinity matrix
         self.affinity=self.get_affinity_matrix()
+        self.size = self.affinity.shape[0]
+        # Run Symbolic Factorization
+        self.symb_fact_affinity()
         
         # Mosek options
         TOL = 1e-10
@@ -87,16 +92,41 @@ class ConsistencyGraphProb():
 
         return eqs, ineqs        
     
-        
-    def get_certificate(self, x_cand):
-        """Attept to generate a certificate for this problem"""
-        # Get cost matrix
-        M = self.affinity
-        # Get Constraints
-        eqs, ineqs = self.get_affine_constraints()
-        
-        
-        
+    @staticmethod
+    def merge_cosmo(cp, ck, np, nk):
+        """clique merge function from COSMO paper:
+        https://arxiv.org/pdf/1901.10887
+
+        Uses the metric:
+        Cp^3  + Ck^3 - (Cp U Ck)^3 > 0
+
+        Args:
+            cp (int): clique order of parent
+            ck (int): clique order of child
+            np (int): supernode order of parent
+            nk (int): supernode order of child
+        """
+        # Metric: Cp^3  + Ck^3 - (Cp + Nk)^3
+        return cp**3 + ck**3 > (cp + nk) ** 3
+
+    def symb_fact_affinity(self, merge_function=None):
+        """Generates the symbolic factorization of the affinity matrix.
+        This factorization generates a clique tree for the associated graph. 
+        Key members: 
+            symb.cliques: list of cliques, each clique is a list of indices, 
+            symb.seperators: list of seperator indices between a given clique and its parent
+            symb.parent: list of the parents of each clique
+        Cliques are listed in reverse topological order.
+        """       
+        # Convert adjacency to sparsity pattern
+        rows, cols = self.affinity.nonzero()
+        S = spmatrix(1.0, rows, cols, self.affinity.shape)
+        # get information from factorization
+        self.symb = chompack.symbolic(S, p=amd.order, merge_function=merge_function)
+        self.cliques = self.symb.cliques()
+        self.seps = self.symb.separators()
+        self.parents = self.symb.parent()
+            
     def solve_cvxpy(self, options=None, verbose = False):
         """Solve the MSRC problem with CVXPY"""
         if options is None:
@@ -221,11 +251,91 @@ class ConsistencyGraphProb():
                 success = False
             info = {"success": success, "cost": cost, "msg": msg, "H": H}
             return X, info
-        
+    
+    
+    def solve_fusion_sparse(self, options=None, verbose = False):
+        """Solve the MSRC problem with Mosek Fusion while exploiting sparsity."""
+        if options is None:
+            options = self.options_fusion
+                
+        with fu.Model("dual") as mdl:
+            if verbose:
+                print("Constructing Problem")
+            
+            obj_list = []
+            trace_con_list = []
+            var_list = []
+            for iClq, clique_inds in enumerate(self.cliques):
+                n = len(clique_inds)
+                # Project cost matrix to current clique
+                M_c = self.affinity[clique_inds,:][:,clique_inds]
+                # Create SDP variable
+                X_c = mdl.variable(f"X_c{iClq}", fu.Domain.inPSDCone(n))
+                var_list.append(X_c)
+                # Add constriants
+                for i in range(n):
+                    for j in range(i,n):
+                        # Construct selection matrix
+                        if i == j:
+                            vals = [1]
+                            rows = [i]
+                            cols= rows
+                        else:
+                            vals = [0.5, 0.5]
+                            rows = [i, j]
+                            cols = [j, i]
+                        A = fu.Matrix.sparse(n, n, rows, cols, vals)
+                        # Each element of X is either zero or non-negative, depending on M
+                        if M_c[i,j] == 0:
+                            mdl.constraint(fu.Expr.dot(A, X_c), fu.Domain.equalsTo(0))
+                        else:
+                            mdl.constraint(fu.Expr.dot(A, X_c), fu.Domain.greaterThan(0))
+                # Add to objective list
+                obj_list.append(fu.Expr.dot(mat_fusion(M_c), X_c))
+                # Add to trace list
+                A = mat_fusion(sp.identity(n, format='csr'))
+                trace_con_list.append(fu.Expr.dot(A, X_c))
+            
+            # Trace constraint 
+            mdl.constraint(fu.Expr.add(trace_con_list), fu.Domain.lessThan(1))
+            
+            # Add affinity matrix objective
+            mdl.objective(fu.ObjectiveSense.Maximize, fu.Expr.add(obj_list))
+
+            if verbose:
+                mdl.setLogHandler(sys.stdout)
+                mdl.writeTask("problem_sparse.ptf")
+
+            for key, val in options.items():
+                mdl.setSolverParam(key, val)
+
+            mdl.acceptedSolutionStatus(fu.AccSolutionStatus.Anything)
+            mdl.solve()
+
+            if mdl.getProblemStatus() in [
+                fu.ProblemStatus.PrimalAndDualFeasible,
+                fu.ProblemStatus.Unknown,
+            ]:
+                # Reconstruct Full Variable
+                X = np.zeros(self.affinity.shape)
+                for iClq, clique_inds in enumerate(self.cliques):
+                    n = len(clique_inds)
+                    X[np.ix_(clique_inds, clique_inds)] += np.reshape(var_list[iClq].level(), (n,n))
+                cost = mdl.primalObjValue()
+                msg = f"success with status {mdl.getProblemStatus()}"
+                success = True
+            else:
+                cost = None
+                X = None
+                msg = f"solver failed with status {mdl.getProblemStatus()}"
+                success = False
+            info = {"success": success, "cost": cost, "msg": msg}
+            return X, info
+    
     def process_sdp_var(self, X):
         # Decompose SDP solution
         evals, evecs = np.linalg.eigh(X)
-        er = evals[-1] / evals[-2] > 1e6
+        er = evals[-1] / evals[-2]
         x_opt = evecs[:,-1] * np.sqrt(evals[-1])
         
         # Select inliers

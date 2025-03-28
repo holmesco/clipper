@@ -40,16 +40,19 @@ class TestClipper(unittest.TestCase):
         # Define problem
         self.prob = ConsistencyGraphProb(self.D1, self.D2, self.A)
         
+        
     def test_affinity_matrix(self):
         affinity_matrix = self.prob.get_affinity_matrix()
         self.assertEqual(affinity_matrix.shape[0], self.n1)
         self.assertEqual(affinity_matrix.shape[1], self.n1)
 
-    def test_affine_constraints(self, tol = 1e-10):
+    def test_affine_constraints(self, X=None, tol = 1e-10):
         eqs, ineqs = self.prob.get_affine_constraints()
         self.assertIsInstance(eqs, list)
         self.assertIsInstance(ineqs, list)
         self.assertGreater(len(eqs) + len(ineqs), 0)
+        if X is None:
+            X = self.X        
         # Test Equalities
         for i, (A,b) in enumerate(eqs):
             assert np.abs(np.trace(A @ self.X) + b) < tol, ValueError(f"Equality Constraint {i} violated!")
@@ -73,10 +76,29 @@ class TestClipper(unittest.TestCase):
         inliers, er, x_opt = self.prob.process_sdp_var(X)
         # Check ER
         assert er > 1e6, ValueError("Solution not rank-1")
+    
+    def test_symb_fact(self):
+        self.prob.symb_fact_affinity()
+        self.assertIsNotNone(self.prob.symb)    
+    
+    def test_solve_fusion_sparse(self):
+        X, info = self.prob.solve_fusion_sparse(verbose=True)
+        self.assertIsNotNone(X)
+        self.assertIn("success", info)
+        self.assertTrue(info["success"])
+        
+        # Process solution
+        inliers, er, x_opt = self.prob.process_sdp_var(X)
+        # Check ER
+        assert er > 1e6, ValueError("Solution not rank-1")
+         
 
 
 
 if __name__ == "__main__":
     test = TestClipper()
     # test.test_affine_constraints()
-    test.test_solve_fusion()
+    # test.test_solve_fusion()
+    # test.test_symb_fact()
+    # test.test_solve_fusion()
+    test.test_solve_fusion_sparse()
