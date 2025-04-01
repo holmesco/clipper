@@ -15,24 +15,9 @@ import chompack
 
 
 class ConsistencyGraphProb():
-    def __init__(self, points_1, points_2, associations):
-        self.points_1 = points_1
-        self.points_2 = points_2
-        self.associations = associations
-        # Define invariant function    
-        iparams = clipperpy.invariants.EuclideanDistanceParams()
-        iparams.sigma = 0.01
-        iparams.epsilon = 0.02
-        invariant = clipperpy.invariants.EuclideanDistance(iparams)
-        # Define rounding strategy
-        params = clipperpy.Params()
-        params.rounding = clipperpy.Rounding.DSD_HEU
-        # define clipper object
-        self.clipper = clipperpy.CLIPPER(invariant, params)
-        # Get pairwise consistency matrix
-        self.clipper.score_pairwise_consistency(points_1, points_2, associations)
+    def __init__(self, affinity):
         # Init affinity matrix
-        self.affinity=self.get_affinity_matrix()
+        self.affinity = affinity
         self.size = self.affinity.shape[0]
         # Run Symbolic Factorization
         self.symb_fact_affinity()
@@ -55,11 +40,7 @@ class ConsistencyGraphProb():
             "intpntSolveForm": "primal",  # has no effect
         }
     
-    def get_affinity_matrix(self):
-        M = self.clipper.get_affinity_matrix()
-        M = sp.csr_array(M)
-        M.eliminate_zeros()
-        return M
+    
         
     def get_affine_constraints(self):
         """Generate all affine constraints for the problem
@@ -117,15 +98,46 @@ class ConsistencyGraphProb():
             symb.seperators: list of seperator indices between a given clique and its parent
             symb.parent: list of the parents of each clique
         Cliques are listed in reverse topological order.
+        
         """       
         # Convert adjacency to sparsity pattern
         rows, cols = self.affinity.nonzero()
-        S = spmatrix(1.0, rows, cols, self.affinity.shape)
+        # NOTE: only store edges on lower triangle to avoid double counting
+        self.edges = [tuple(sorted([rows[i], cols[i]])) for i in range(len(rows)) if rows[i]>=cols[i]]
+        self.pattern = spmatrix(1.0, rows, cols, self.affinity.shape)
         # get information from factorization
-        self.symb = chompack.symbolic(S, p=amd.order, merge_function=merge_function)
+        self.symb = chompack.symbolic(self.pattern, p=amd.order, merge_function=merge_function)
         self.cliques = self.symb.cliques()
-        self.seps = self.symb.separators()
+        self.sepsets = self.symb.separators()
         self.parents = self.symb.parent()
+        # Get variable list in permuted order (symbolic factorization reorders things)
+        var_list = list(range(self.size))
+        var_list_perm = [var_list[p] for p in self.symb.p]
+        self.ind_to_clq=dict()
+        for iClq, clique in enumerate(self.cliques):
+            # Get the cliques and separator sets in the original ordering
+            self.cliques[iClq] = [var_list_perm[v] for v in clique]
+            self.sepsets[iClq] = set([var_list_perm[v] for v in self.sepsets[iClq]])
+            # Generate mapping from index to clique mapping as a dictionary of lists
+            for ind in clique:
+                if ind not in self.ind_to_clq.keys():
+                    self.ind_to_clq[ind] = set([iClq])
+                else:
+                    self.ind_to_clq[ind].add(iClq)
+        # Get a list of "fill-in" edges
+        pattern_filled = self.symb.sparsity_pattern(reordered=False)
+        fillin = pattern_filled - self.pattern
+        self.fill_edges = []
+        self.fill_pattern = cvxmat2sparse(fillin)
+        self.fill_pattern.eliminate_zeros()
+        # NOTE: only store edges on lower triangle to avoid double counting
+        self.fill_edges = [tuple(sorted(edge)) for edge in zip(*self.fill_pattern.nonzero()) if edge[0] >= edge[1]]
+        
+        # Keep filed pattern
+        self.filled_pattern = cvxmat2sparse(pattern_filled)
+        self.filled_pattern.eliminate_zeros()
+        
+        
             
     def solve_cvxpy(self, options=None, verbose = False):
         """Solve the MSRC problem with CVXPY"""
@@ -184,13 +196,8 @@ class ConsistencyGraphProb():
         if options is None:
             options = self.options_fusion
         
-        # Get the affinity matrix in sparse format
-        if verbose:
-            print("Retrieving affinity matrix")
-        M = self.clipper.get_affinity_matrix()
-        M = sp.csr_array(M)
-        M.eliminate_zeros()
-        n = M.shape[0]
+        n = self.size
+        M = self.affinity
         
         with fu.Model("dual") as mdl:
             if verbose:
@@ -264,37 +271,45 @@ class ConsistencyGraphProb():
             
             obj_list = []
             trace_con_list = []
-            var_list = []
+            X_cs = []
+            # Generate cliques variables and trace constraint
             for iClq, clique_inds in enumerate(self.cliques):
                 n = len(clique_inds)
-                # Project cost matrix to current clique
-                M_c = self.affinity[clique_inds,:][:,clique_inds]
                 # Create SDP variable
-                X_c = mdl.variable(f"X_c{iClq}", fu.Domain.inPSDCone(n))
-                var_list.append(X_c)
-                # Add constriants
-                for i in range(n):
-                    for j in range(i,n):
-                        # Construct selection matrix
-                        if i == j:
-                            vals = [1]
-                            rows = [i]
-                            cols= rows
-                        else:
-                            vals = [0.5, 0.5]
-                            rows = [i, j]
-                            cols = [j, i]
-                        A = fu.Matrix.sparse(n, n, rows, cols, vals)
-                        # Each element of X is either zero or non-negative, depending on M
-                        if M_c[i,j] == 0:
-                            mdl.constraint(fu.Expr.dot(A, X_c), fu.Domain.equalsTo(0))
-                        else:
-                            mdl.constraint(fu.Expr.dot(A, X_c), fu.Domain.greaterThan(0))
-                # Add to objective list
-                obj_list.append(fu.Expr.dot(mat_fusion(M_c), X_c))
-                # Add to trace list
+                X_cs.append(mdl.variable(f"X_c{iClq}", fu.Domain.inPSDCone(n)))
+                # Trace constraint
                 A = mat_fusion(sp.identity(n, format='csr'))
-                trace_con_list.append(fu.Expr.dot(A, X_c))
+                trace_con_list.append(fu.Expr.dot(A, X_cs[-1]))
+                      
+            # Enforce inequalities and construct objective on the edges of the association graph
+            obj_list = []
+            # NOTE: we assume here that edges correspond to the lower triangle of the affinity matrix
+            for edge in self.edges:
+                # Build expression
+                clq_var_list = []
+                for iClq, ind0, ind1 in self.get_clique_inds(edge):
+                    # Add to list of clique variables
+                    clq_var_list.append(X_cs[iClq].index(ind0, ind1))
+                # Add doubly non-negative constraint
+                clq_sum = fu.Expr.add(clq_var_list)
+                mdl.constraint(clq_sum, fu.Domain.greaterThan(0))
+                # Add to objective
+                if edge[0] == edge[1]:
+                    # Along Diagonal
+                    obj_list.append(fu.Expr.mul(self.affinity[edge], clq_sum))
+                else:
+                    # Off-Diagonal (multiply by 2)
+                    obj_list.append(fu.Expr.mul(2*self.affinity[edge], clq_sum))
+            # Enforce equalities on the fill-in edges
+            for edge in self.fill_edges:
+                # Build expression
+                clq_var_list = []
+                for iClq, ind0, ind1 in self.get_clique_inds(edge):
+                    # Add to list of clique variables
+                    clq_var_list.append(X_cs[iClq].index(ind0, ind1))
+                # Add doubly non-negative constraint
+                clq_sum = fu.Expr.add(clq_var_list)
+                mdl.constraint(clq_sum, fu.Domain.equalTo(0))
             
             # Trace constraint 
             mdl.constraint(fu.Expr.add(trace_con_list), fu.Domain.lessThan(1))
@@ -320,7 +335,7 @@ class ConsistencyGraphProb():
                 X = np.zeros(self.affinity.shape)
                 for iClq, clique_inds in enumerate(self.cliques):
                     n = len(clique_inds)
-                    X[np.ix_(clique_inds, clique_inds)] += np.reshape(var_list[iClq].level(), (n,n))
+                    X[np.ix_(clique_inds, clique_inds)] += np.reshape(X_cs[iClq].level(), (n,n))
                 cost = mdl.primalObjValue()
                 msg = f"success with status {mdl.getProblemStatus()}"
                 success = True
@@ -331,6 +346,23 @@ class ConsistencyGraphProb():
                 success = False
             info = {"success": success, "cost": cost, "msg": msg}
             return X, info
+    
+    def get_clique_inds(self, edge):
+        """Find all cliques that contain a given edge in the graph. Return tuple of variable indices in the form: (Clique index, row index, column index) """
+        # Find the cliques that include the edge
+        clique0_inds = self.ind_to_clq[edge[0]]
+        clique1_inds = self.ind_to_clq[edge[1]]
+        clique_inds = clique0_inds & clique1_inds
+        # Combine vars across cliques
+        var_list = []
+        for clq_ind in clique_inds:
+            clique = self.cliques[clq_ind]
+            ind0 = clique.index(edge[0])
+            ind1 = clique.index(edge[1])
+            var_list.append((clq_ind, ind0, ind1))
+        
+        return var_list
+        
     
     def process_sdp_var(self, X):
         # Decompose SDP solution
@@ -356,6 +388,12 @@ def mat_fusion(X):
     V = X.data.astype(np.double)
     return fu.Matrix.sparse(*X.shape, I, J, V)
 
+def cvxmat2sparse(X:spmatrix):
+    rows = np.array(X.I)[:,0]
+    cols = np.array(X.J)[:,0]
+    vals = np.array(X.V)[:,0]
+    return sp.csc_array((vals, (rows, cols)), X.size)
+
 def randsphere(m,n,r):
     """Draw random points from within a sphere."""
     X = np.random.randn(m, n)
@@ -363,7 +401,7 @@ def randsphere(m,n,r):
     X = X * np.tile((r*(gammainc(n/2,s2/2)**(1/n)) / np.sqrt(s2)).reshape(-1,1),(1,n))
     return X
         
-def generate_dataset(pcfile, m, n1, n2o, outrat, sigma, T_21):
+def generate_bunny_dataset(pcfile, m, n1, n2o, outrat, sigma, T_21):
         """Generate a dataset for the registration problem.
         
         Parameters
@@ -462,4 +500,25 @@ def draw_registration_result(source, target, transformation):
     target_temp.paint_uniform_color([0, 0.651, 0.929])
     source_temp.transform(transformation)
     o3d.visualization.draw_geometries([source_temp, target_temp])
+    
+def get_affinity_from_points(points_1, points_2, associations):
+    # Define invariant function    
+    iparams = clipperpy.invariants.EuclideanDistanceParams()
+    iparams.sigma = 0.01
+    iparams.epsilon = 0.02
+    invariant = clipperpy.invariants.EuclideanDistance(iparams)
+    # Define rounding strategy
+    params = clipperpy.Params()
+    params.rounding = clipperpy.Rounding.DSD_HEU
+    # define clipper object
+    clipper = clipperpy.CLIPPER(invariant, params)
+    # Get pairwise consistency matrix
+    clipper.score_pairwise_consistency(points_1, points_2, associations)
+    # Get affinity
+    M = clipper.get_affinity_matrix()
+    M = sp.csr_array(M)
+    M.eliminate_zeros()
+    return M, clipper
+        
+    
     

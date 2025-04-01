@@ -12,6 +12,7 @@ requires-python = "==3.8.*"
 dependencies = [
     "numpy",
     "scipy",
+    "PyQt5",
     "matplotlib",
     "pybind11",
     "open3d",
@@ -19,6 +20,7 @@ dependencies = [
     "cvxpy",
     "cvxopt",
     "chompack",
+    "networkx",
     "pip",
 ]
 
