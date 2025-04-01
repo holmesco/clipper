@@ -21,6 +21,7 @@ dependencies = [
     "cvxopt",
     "chompack",
     "networkx",
+    "line_profiler",
     "pip",
 ]
 
@@ -32,5 +33,6 @@ dev = [
     "pytest",
     "mypy",
     "black",
-    "isort"
+    "isort",
+    "autopep8"
 ]

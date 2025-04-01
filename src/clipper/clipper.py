@@ -10,6 +10,7 @@ import scipy.sparse as sp
 import clipperpy
 from cvxopt import amd, spmatrix
 import chompack
+from time import time
 
 
 
@@ -17,13 +18,17 @@ import chompack
 class ConsistencyGraphProb():
     def __init__(self, affinity):
         # Init affinity matrix
-        self.affinity = affinity
+        if sp.issparse(affinity):
+            self.affinity = affinity
+        else:
+            self.affinity = sp.csc_array(affinity)
+        
         self.size = self.affinity.shape[0]
         # Run Symbolic Factorization
         self.symb_fact_affinity()
         
         # Mosek options
-        TOL = 1e-10
+        TOL = 1e-7
         self.options_cvxpy = {}
         self.options_cvxpy["mosek_params"] = {
             "MSK_IPAR_INTPNT_MAX_ITERATIONS": 500,
@@ -106,6 +111,8 @@ class ConsistencyGraphProb():
         self.edges = [tuple(sorted([rows[i], cols[i]])) for i in range(len(rows)) if rows[i]>=cols[i]]
         self.pattern = spmatrix(1.0, rows, cols, self.affinity.shape)
         # get information from factorization
+        if merge_function is None:
+            merge_function = self.merge_cosmo
         self.symb = chompack.symbolic(self.pattern, p=amd.order, merge_function=merge_function)
         self.cliques = self.symb.cliques()
         self.sepsets = self.symb.separators()
@@ -119,7 +126,7 @@ class ConsistencyGraphProb():
             self.cliques[iClq] = [var_list_perm[v] for v in clique]
             self.sepsets[iClq] = set([var_list_perm[v] for v in self.sepsets[iClq]])
             # Generate mapping from index to clique mapping as a dictionary of lists
-            for ind in clique:
+            for ind in self.cliques[iClq]:
                 if ind not in self.ind_to_clq.keys():
                     self.ind_to_clq[ind] = set([iClq])
                 else:
@@ -259,7 +266,7 @@ class ConsistencyGraphProb():
             info = {"success": success, "cost": cost, "msg": msg, "H": H}
             return X, info
     
-    
+
     def solve_fusion_sparse(self, options=None, verbose = False):
         """Solve the MSRC problem with Mosek Fusion while exploiting sparsity."""
         if options is None:
@@ -268,7 +275,7 @@ class ConsistencyGraphProb():
         with fu.Model("dual") as mdl:
             if verbose:
                 print("Constructing Problem")
-            
+            t0 = time()
             obj_list = []
             trace_con_list = []
             X_cs = []
@@ -309,7 +316,7 @@ class ConsistencyGraphProb():
                     clq_var_list.append(X_cs[iClq].index(ind0, ind1))
                 # Add doubly non-negative constraint
                 clq_sum = fu.Expr.add(clq_var_list)
-                mdl.constraint(clq_sum, fu.Domain.equalTo(0))
+                mdl.constraint(clq_sum, fu.Domain.equalsTo(0))
             
             # Trace constraint 
             mdl.constraint(fu.Expr.add(trace_con_list), fu.Domain.lessThan(1))
@@ -323,10 +330,10 @@ class ConsistencyGraphProb():
 
             for key, val in options.items():
                 mdl.setSolverParam(key, val)
-
             mdl.acceptedSolutionStatus(fu.AccSolutionStatus.Anything)
+            t1 = time()
             mdl.solve()
-
+            t2 = time()
             if mdl.getProblemStatus() in [
                 fu.ProblemStatus.PrimalAndDualFeasible,
                 fu.ProblemStatus.Unknown,
@@ -344,7 +351,7 @@ class ConsistencyGraphProb():
                 X = None
                 msg = f"solver failed with status {mdl.getProblemStatus()}"
                 success = False
-            info = {"success": success, "cost": cost, "msg": msg}
+            info = {"success": success, "cost": cost, "msg": msg, "time_setup":t1-t0,"time_solve":t2-t1}
             return X, info
     
     def get_clique_inds(self, edge):
@@ -372,7 +379,7 @@ class ConsistencyGraphProb():
         
         # Select inliers
         thresh = np.max(x_opt) / 2
-        inliers = x_opt > thresh
+        inliers = (x_opt > thresh).astype(float)
         
         return inliers, er, x_opt
 
