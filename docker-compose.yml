@@ -11,6 +11,7 @@ services:
       - ./:/workspace
       - /tmp/.X11-unix:/tmp/.X11-unix
       - $HOME/.Xauthority:/root/.Xauthority:rw
+      - $HOME/.ssh/:/root/.ssh:r
     shm_size: 1g
     environment:
       - DISPLAY=$DISPLAY

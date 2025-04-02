@@ -34,5 +34,6 @@ dev = [
     "mypy",
     "black",
     "isort",
-    "autopep8"
+    "autopep8",
+    "flake8"
 ]

@@ -6,7 +6,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import unittest
 
-from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points
+from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, mat2vec_ind
 
 class TestClipper(unittest.TestCase):
     def __init__(self, test_prob = "three-clique"):
@@ -96,6 +96,33 @@ class TestClipper(unittest.TestCase):
         self.assertTrue(info["success"])
         
         self.check_solution(X)
+    
+    def test_scs_setup(self):
+        cone, data = self.prob.get_scs_setup()
+        ncvars = cone['l'] + np.sum([n*(n+1)/2 for n in cone['s']])
+        nclqvars = 0
+        for c in self.prob.cliques:
+            nclqvars += len(c)*(len(c)+1)/2
+        assert data['A'].shape == (data['b'].shape[0], data['c'].shape[0]), ValueError("A matrix has wrong shape")
+        if self.test_prob == "two-cliques":
+            npos = 5*6/2 + 3*4/2+1
+            assert data['A'].shape[1] == npos, ValueError("wrong number of constraints")
+            assert data['A'].shape[0] == npos+nclqvars, ValueError("wrong number of variables")
+        if self.test_prob == "three-clique":
+            npos = 5*6/2 + 1 + 3*4/2 + 1
+            assert data['A'].shape[1] == npos, ValueError("wrong number of constraints")
+            assert data['A'].shape[0] == npos+nclqvars, ValueError("wrong number of variables")
+    
+    def test_mat2vec_ind(self, n=10):
+        cols, rows = np.triu_indices(n)
+        inds = list(zip(rows, cols))
+        vec_inds = [mat2vec_ind(n, row, col) for row, col in inds]
+        assert np.all(vec_inds == list(range(len(vec_inds)))), ValueError("Vectorization indexing not working")
+        
+    
+    def test_solve_scs(self):
+        X, info = self.prob.solve_scs_sparse(verbose=True)
+        self.check_solution(X)
         
     
     def test_symb_fact(self, plot=False):
@@ -137,7 +164,7 @@ class TestClipper(unittest.TestCase):
         self.assertTrue(info["success"])
         self.check_solution(X)
         
-    def check_solution(self,X):
+    def check_solution(self, X):
         """Check that solution is rank 1 and that the solution matches what we expect."""
         # Process solution
         inliers, er, x_opt = self.prob.process_sdp_var(X)
@@ -146,7 +173,7 @@ class TestClipper(unittest.TestCase):
         
         if self.test_prob == "two-clique":
             assert np.all(inliers.astype(float) == self.x.flatten()), ValueError("Solution is not correct")
-        elif self.test_prob == "two-clique":
+        elif self.test_prob == "three-clique":
             assert np.all(inliers.astype(float) == self.x.flatten()), ValueError("Solution is not correct")
         elif self.test_prob == "bunny":
             # Solve using original clipper
@@ -157,11 +184,13 @@ class TestClipper(unittest.TestCase):
             assert np.all(inliers == inliers_clipper), ValueError("Python SDP solution does not match CLIPPER SDR solution")
 
 
-
 if __name__ == "__main__":
     test = TestClipper(test_prob="bunny")
     # test.test_affine_constraints()
     # test.test_solve_fusion()
     # test.test_symb_fact(plot=False)
-    test.test_solve_fusion()
+    # test.test_solve_fusion()
     # test.test_solve_fusion_sparse()
+    # test.test_scs_setup()
+    # test.test_mat2vec_ind()
+    test.test_solve_scs()

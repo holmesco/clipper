@@ -11,9 +11,7 @@ import clipperpy
 from cvxopt import amd, spmatrix
 import chompack
 from time import time
-
-
-
+import scs
 
 class ConsistencyGraphProb():
     def __init__(self, affinity):
@@ -108,7 +106,7 @@ class ConsistencyGraphProb():
         # Convert adjacency to sparsity pattern
         rows, cols = self.affinity.nonzero()
         # NOTE: only store edges on lower triangle to avoid double counting
-        self.edges = [tuple(sorted([rows[i], cols[i]])) for i in range(len(rows)) if rows[i]>=cols[i]]
+        self.edges = [tuple([rows[i], cols[i]]) for i in range(len(rows)) if rows[i]>=cols[i]]
         self.pattern = spmatrix(1.0, rows, cols, self.affinity.shape)
         # get information from factorization
         if merge_function is None:
@@ -138,7 +136,7 @@ class ConsistencyGraphProb():
         self.fill_pattern = cvxmat2sparse(fillin)
         self.fill_pattern.eliminate_zeros()
         # NOTE: only store edges on lower triangle to avoid double counting
-        self.fill_edges = [tuple(sorted(edge)) for edge in zip(*self.fill_pattern.nonzero()) if edge[0] >= edge[1]]
+        self.fill_edges = [tuple(edge) for edge in zip(*self.fill_pattern.nonzero()) if edge[0] >= edge[1]]
         
         # Keep filed pattern
         self.filled_pattern = cvxmat2sparse(pattern_filled)
@@ -209,6 +207,7 @@ class ConsistencyGraphProb():
         with fu.Model("dual") as mdl:
             if verbose:
                 print("Constructing Problem")
+            t0 = time()
             # Create SDP variable
             X = mdl.variable("X", fu.Domain.inPSDCone(n))
             # Add constriants
@@ -246,8 +245,9 @@ class ConsistencyGraphProb():
                 mdl.setSolverParam(key, val)
 
             mdl.acceptedSolutionStatus(fu.AccSolutionStatus.Anything)
+            t1 = time()
             mdl.solve()
-
+            t2 = time()
             if mdl.getProblemStatus() in [
                 fu.ProblemStatus.PrimalAndDualFeasible,
                 fu.ProblemStatus.Unknown,
@@ -263,7 +263,7 @@ class ConsistencyGraphProb():
                 X = None
                 msg = f"solver failed with status {mdl.getProblemStatus()}"
                 success = False
-            info = {"success": success, "cost": cost, "msg": msg, "H": H}
+            info = {"success": success, "cost": cost, "msg": msg, "H": H, "time_setup":t1-t0, "time_solve":t2-t1}
             return X, info
     
 
@@ -354,19 +354,146 @@ class ConsistencyGraphProb():
             info = {"success": success, "cost": cost, "msg": msg, "time_setup":t1-t0,"time_solve":t2-t1}
             return X, info
     
+    def get_scs_setup(self):
+        """Generate the matrices and parameters to solve the sparse problem with SCS
+        Constraints:
+        A^T y + c = [-I    A_p ] [y_p] +  0 == 0
+                    [0 -1  A_tr] [y_z] +  1 == 0
+                    [ 0    A_z ]       +  0 == 0
+        NOTE: We build At rather than A (using dual opt form)
+                    
+        """
+        # Generate clique information
+        clq_sizes = [] # Size of each clique variable
+        clq_start = [] # Starting indices of cliques
+        ind = 0
+        for clq in self.cliques:
+            clq_sizes.append(len(clq))
+            clq_start.append(ind)
+            ind += int(len(clq)*(len(clq)+1)/2)
+        # define cones
+        n_pos = len(self.edges)+1
+        cone = dict(l=n_pos, s=clq_sizes)
+        # Adjust starting indices
+        clq_start = clq_start
+        n_clique_vars = ind
+        n_vars = n_clique_vars + n_pos
+        # Construct Ap and objective by looping through edges in assoc graph
+        b = np.zeros(n_vars)
+        Ap_rows, Ap_cols, Ap_data = [], [], []
+        row_ind = 0
+        # NOTE: we assume here that edges correspond to the lower triangle of the affinity matrix
+        for edge in self.edges:
+            # Loop through cliques and add to sum
+            for iClq, row_c, col_c in self.get_clique_inds(edge):
+                # Off diagonal multiplier
+                if row_c == col_c:
+                    mult = 1
+                else:
+                    mult = np.sqrt(2)
+                # Get vectorized matrix index
+                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
+                # Offset with clique starting index
+                Ap_cols.append(vec_ind + clq_start[iClq])
+                Ap_rows.append(row_ind)
+                Ap_data.append(mult)
+                # Add to objective
+                # NOTE: Objective could also be defined on the positive cone vars
+                b[vec_ind + clq_start[iClq]+n_pos] += -mult * self.affinity[edge]
+            # increment row of At
+            row_ind += 1
+        # Build Ap matrix
+        Ap = sp.csc_array((Ap_data, (Ap_rows, Ap_cols)), shape=(n_pos-1,n_clique_vars))
+        # Construct A_tr (negative trace)
+        Atr_rows, Atr_cols, Atr_data = [], [], []
+        row_ind = 0
+        # Loop through cliques and add to sum
+        for iClq, size in enumerate(clq_sizes):
+            for i in range(size):
+                # Get vectorized matrix index
+                vec_ind = mat2vec_ind(size, i, i)
+                # Offset with clique starting index
+                Atr_cols.append(vec_ind + clq_start[iClq])
+                Atr_rows.append(0)
+                Atr_data.append(-1)
+        Atr = sp.csc_array((Atr_data, (Atr_rows, Atr_cols)), shape=(1,n_clique_vars))
+        # Construct Az
+        Az_rows, Az_cols, Az_data = [], [], []
+        row_ind = 0
+        for edge in self.fill_edges:
+            # Loop through cliques and add to sum
+            for iClq, row_c, col_c in self.get_clique_inds(edge):
+                if row_c == col_c:
+                    mult = 1
+                else:
+                    mult = np.sqrt(2)
+                # Get vectorized matrix index
+                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
+                # Offset with clique starting index
+                Az_cols.append(vec_ind + clq_start[iClq])
+                Az_rows.append(row_ind)
+                Az_data.append(mult)
+            # increment row of At
+            row_ind += 1
+        # Build A_p matrix
+        Az = sp.csc_array((Az_data, (Az_rows, Az_cols)), shape=(row_ind, n_clique_vars))
+        # Build full matrix
+        I = sp.eye(n_pos, format='csc')
+        Z = sp.csc_array((Az.shape[0], n_pos))
+        At_top = sp.hstack([-I, sp.vstack([Ap, Atr])])
+        At = sp.vstack([At_top, sp.hstack([Z, Az])])
+        # Create c array
+        c = np.zeros(n_pos + Az.shape[0])
+        c[n_pos-1] = 1
+        # Build data dict
+        data = dict(A=At.T, b=b, c=c)
+        
+        return cone, data
+        
+    def solve_scs_sparse(self, **kwargs):
+        """ Run SCS on (sparse) version of problem."""
+        # Set up problem
+        t0 = time()
+        cone, data = self.get_scs_setup()
+        solver = scs.SCS(data, cone, **kwargs)
+        t1 = time()
+        # Run Solver
+        sol = solver.solve()
+        t2 = time()
+        # Rebuild the solution
+        X = np.zeros(self.affinity.shape)
+        start_ind = cone['l']
+        for clique_inds in self.cliques:
+            size = len(clique_inds)
+            vec_size = int((size+1)*size/2)
+            X_c = mat(sol['y'][start_ind: start_ind+vec_size])
+            X[np.ix_(clique_inds, clique_inds)] += X_c
+            start_ind += vec_size
+        # Store useful information
+        info = dict(**sol)
+        info['time_setup'] = t1 - t0
+        info['time_solve'] = t2 - t1
+        return X, info
+        
+        
+    
     def get_clique_inds(self, edge):
         """Find all cliques that contain a given edge in the graph. Return tuple of variable indices in the form: (Clique index, row index, column index) """
         # Find the cliques that include the edge
         clique0_inds = self.ind_to_clq[edge[0]]
         clique1_inds = self.ind_to_clq[edge[1]]
         clique_inds = clique0_inds & clique1_inds
-        # Combine vars across cliques
+        # get vars across cliques
         var_list = []
         for clq_ind in clique_inds:
             clique = self.cliques[clq_ind]
             ind0 = clique.index(edge[0])
             ind1 = clique.index(edge[1])
-            var_list.append((clq_ind, ind0, ind1))
+            # append to list, ensure that only lower triangle stored
+            if ind0 >= ind1:
+                var_list.append((clq_ind,ind0, ind1))
+            else:
+                var_list.append((clq_ind, ind1, ind0))
         
         return var_list
         
@@ -383,6 +510,28 @@ class ConsistencyGraphProb():
         
         return inliers, er, x_opt
 
+# The vec function as documented in api/cones
+def vec(S):
+    n = S.shape[0]
+    S = np.copy(S)
+    S *= np.sqrt(2)
+    S[range(n), range(n)] /= np.sqrt(2)
+    return S[np.triu_indices(n)]
+
+
+# The mat function as documented in api/cones
+def mat(s):
+    n = int((np.sqrt(8 * len(s) + 1) - 1) / 2)
+    S = np.zeros((n, n))
+    S[np.triu_indices(n)] = s / np.sqrt(2)
+    S = S + S.T
+    S[range(n), range(n)] /= np.sqrt(2)
+    return S
+
+def mat2vec_ind(n, row, col):
+    assert row >= col, ValueError("Lower triangular indices are assumed")
+    return int(n*col - (col-1)*col/2 + row - col )
+    
 def mat_fusion(X):
     """Convert sparse matrix X to fusion format"""
     try:
@@ -526,6 +675,7 @@ def get_affinity_from_points(points_1, points_2, associations):
     M = sp.csr_array(M)
     M.eliminate_zeros()
     return M, clipper
+
         
     
     
