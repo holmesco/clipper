@@ -8,7 +8,7 @@ import cvxpy as cp
 import mosek.fusion as fu
 import scipy.sparse as sp
 import clipperpy
-from cvxopt import amd, spmatrix
+from cvxopt import amd, spmatrix, matrix
 import chompack
 from time import time
 import scs
@@ -93,7 +93,7 @@ class ConsistencyGraphProb():
         # Metric: Cp^3  + Ck^3 - (Cp + Nk)^3
         return cp**3 + ck**3 > (cp + nk) ** 3
 
-    def symb_fact_affinity(self, merge_function=None):
+    def symb_fact_affinity(self, order = None, merge_func="cosmo"):
         """Generates the symbolic factorization of the affinity matrix.
         This factorization generates a clique tree for the associated graph. 
         Key members: 
@@ -109,9 +109,15 @@ class ConsistencyGraphProb():
         self.edges = [tuple([rows[i], cols[i]]) for i in range(len(rows)) if rows[i]>=cols[i]]
         self.pattern = spmatrix(1.0, rows, cols, self.affinity.shape)
         # get information from factorization
-        if merge_function is None:
+        if merge_func == "cosmo":
             merge_function = self.merge_cosmo
-        self.symb = chompack.symbolic(self.pattern, p=amd.order, merge_function=merge_function)
+        else:
+            merge_function = None
+        if order is None:
+            order = amd.order
+        else:
+            order = matrix(order)
+        self.symb = chompack.symbolic(self.pattern, p=order, merge_function=merge_function)
         self.cliques = self.symb.cliques()
         self.sepsets = self.symb.separators()
         self.parents = self.symb.parent()
@@ -119,6 +125,7 @@ class ConsistencyGraphProb():
         var_list = list(range(self.size))
         var_list_perm = [var_list[p] for p in self.symb.p]
         self.ind_to_clq=dict()
+        self.clique_dicts = []
         for iClq, clique in enumerate(self.cliques):
             # Get the cliques and separator sets in the original ordering
             self.cliques[iClq] = [var_list_perm[v] for v in clique]
@@ -129,6 +136,9 @@ class ConsistencyGraphProb():
                     self.ind_to_clq[ind] = set([iClq])
                 else:
                     self.ind_to_clq[ind].add(iClq)
+            # Define clique dictionary for fast index lookup
+            clique_dict = {value : index for index, value in enumerate(self.cliques[iClq])}
+            self.clique_dicts.append(clique_dict)
         # Get a list of "fill-in" edges
         pattern_filled = self.symb.sparsity_pattern(reordered=False)
         fillin = pattern_filled - self.pattern
@@ -354,6 +364,7 @@ class ConsistencyGraphProb():
             info = {"success": success, "cost": cost, "msg": msg, "time_setup":t1-t0,"time_solve":t2-t1}
             return X, info
     
+    
     def get_scs_setup(self):
         """Generate the matrices and parameters to solve the sparse problem with SCS
         Constraints:
@@ -449,16 +460,79 @@ class ConsistencyGraphProb():
         data = dict(A=At.T, b=b, c=c)
         
         return cone, data
+    
+    def compute_warmstart(self, cone, data, warmstart = "max-density"):
+        """Compute warm start for SCS."""
         
-    def solve_scs_sparse(self, **kwargs):
-        """ Run SCS on (sparse) version of problem."""
+        # Get the index of the best clique
+        if warmstart == "max-density":
+            vals = []
+            for clique in self.cliques:
+                affinity_clique = self.affinity[np.ix_(clique,clique)]
+                vals.append(np.sum(affinity_clique.data))
+            best_clique_ind = np.argmax(vals)
+        elif warmstart == "max-clique":
+            best_clique_ind = np.argmax([len(clique) for clique in self.cliques])
+        
+        # Generate the init SDP matrix by setting the variables of the best clique
+        y_sdp = []
+        for iClq, clique in enumerate(self.cliques):
+            if iClq == best_clique_ind:
+                X = np.ones((len(clique),len(clique)))
+                mask = self.affinity[np.ix_(clique,clique)] > 0
+                X = X * mask 
+                X = X.toarray() / len(clique) # divide by trace to normalize
+            else:
+                X = np.zeros((len(clique),len(clique)))
+            # Add to list
+            y_sdp.append(vec(X))
+        y_sdp = np.concatenate(y_sdp)
+        # Compute the other cone vars from the constraints
+        n_pos = cone['l']
+        A_p = data['A'].T[:n_pos, n_pos:]
+        y_p = data['c'][:n_pos,None] + (A_p @ y_sdp[:,None])
+        y = np.concatenate([y_p[:,0],y_sdp])
+        # Make param dict
+        solver_kwargs = dict(warm_start=True,
+                             x = None,
+                             y=y,
+                             s=None)
+        
+        return solver_kwargs
+        
+            
+            
+    
+    def solve_scs_sparse(self, setup_kwargs,warmstart=None):
+        """
+        Solve a sparse optimization problem using the SCS solver.
+        This method sets up and solves a sparse version of the optimization problem 
+        using the Splitting Conic Solver (SCS). It also reconstructs the solution 
+        matrix and stores relevant timing and solver information.
+        Args:
+            setup_kwargs (dict): Keyword arguments to configure the SCS solver setup.
+            solve_kwargs (dict): Keyword arguments to configure the SCS solver execution.
+        Returns:
+            tuple:
+                - X (numpy.ndarray): The reconstructed solution matrix.
+                - info (dict): A dictionary containing solver information, including:
+                    - 'time_setup': Time taken to set up the problem.
+                    - 'time_solve': Time taken to solve the problem.
+                    - Additional solver output from SCS.
+        """ 
         # Set up problem
         t0 = time()
         cone, data = self.get_scs_setup()
-        solver = scs.SCS(data, cone, **kwargs)
+        solver = scs.SCS(data, cone, **setup_kwargs)
+        # Get initialization point 
+        if warmstart is None:
+            solve_kwargs = dict()
+        else:
+            solve_kwargs = self.compute_warmstart(cone,data,warmstart)
         t1 = time()
+        
         # Run Solver
-        sol = solver.solve()
+        sol = solver.solve(**solve_kwargs)
         t2 = time()
         # Rebuild the solution
         X = np.zeros(self.affinity.shape)
@@ -476,7 +550,6 @@ class ConsistencyGraphProb():
         return X, info
         
         
-    
     def get_clique_inds(self, edge):
         """Find all cliques that contain a given edge in the graph. Return tuple of variable indices in the form: (Clique index, row index, column index) """
         # Find the cliques that include the edge
@@ -486,9 +559,8 @@ class ConsistencyGraphProb():
         # get vars across cliques
         var_list = []
         for clq_ind in clique_inds:
-            clique = self.cliques[clq_ind]
-            ind0 = clique.index(edge[0])
-            ind1 = clique.index(edge[1])
+            ind0 = self.clique_dicts[clq_ind][edge[0]]
+            ind1 = self.clique_dicts[clq_ind][edge[1]]
             # append to list, ensure that only lower triangle stored
             if ind0 >= ind1:
                 var_list.append((clq_ind,ind0, ind1))
