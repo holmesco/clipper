@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from time import time
 from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points
 from sksparse import cholmod
-from pandas import DataFrame
+import pandas as pd
 import seaborn as sns
 
 PARAMS_SCS_DFLT = dict(max_iters = 2000,
@@ -20,7 +20,7 @@ PARAMS_SCS_DFLT = dict(max_iters = 2000,
                       verbose = False)
 
 class BunnyProb():
-    def __init__(self, m = 100, n1 = 100, n2o = 10, outrat = 0.9, sigma = 0.01, threshold=0, seed=0):
+    def __init__(self, m = 100, n1 = 100, n2o = 10, outrat = 0.9, sigma = 0.01, threshold=None, seed=0):
         self.outrat = outrat
         # Set up common variables for tests
         pcfile = 'examples/data/bun10k.ply'
@@ -44,12 +44,17 @@ class BunnyProb():
                 x[i] = 0
         self.x = x
         # Set up python version of the problem
-        if threshold > 0:
-            affinity = threshold_affinity(self.affinity)
-        else:
-            affinity = self.affinity
-        self.cgraph = ConsistencyGraphProb(affinity=affinity)
+        self.cgraph = ConsistencyGraphProb(affinity=self.affinity, threshold=threshold)
 
+    def get_prec_recall(self, inliers):
+        # Report information
+        true_pos = np.sum(self.x * inliers)
+        all_pos = np.sum(inliers)
+        all_true_pos = np.sum(self.x)
+        precision = true_pos / all_pos
+        recall = true_pos /  all_true_pos 
+    
+        return precision, recall
         
     def solve_clipper(self):
         """Solve SDP using CLIPPER formulation"""
@@ -68,28 +73,12 @@ class BunnyProb():
         inliers, er, x_opt = self.cgraph.process_sdp_var(X)
         return inliers, info['time_setup'], info['time_solve']
     
-    def solve_fusion(self, verbose=False):
-        X, info = self.cgraph.solve_fusion(verbose=verbose)
-        inliers, er, x_opt = self.cgraph.process_sdp_var(X)
-        return inliers, info['time_setup'], info['time_solve']
-    
     def solve_scs_sparse(self, setup_kwargs, warmstart):
         X, info = self.cgraph.solve_scs_sparse(setup_kwargs, warmstart)
         inliers, er, x_opt = self.cgraph.process_sdp_var(X)
+        
         return inliers, info['time_setup'], info['time_solve']
 
-def threshold_affinity(M, thresh = 0.5):
-    """Threshold the affinity matrix"""
-    cols_thrsh, rows_thrsh = [], []
-    rows, cols = M.nonzero()
-    vals = M.data
-    for i in range(len(cols)):
-        if vals[i] >= thresh:
-            cols_thrsh.append(cols[i])
-            rows_thrsh.append(rows[i])
-        
-    M_thrsh = sp.sparse.csc_array((np.ones(len(cols_thrsh)),(rows_thrsh, cols_thrsh)), shape=M.shape)
-    return M_thrsh
 
 def study_graph_decomp(mult=2):
     # Get setup
@@ -111,7 +100,7 @@ def study_graph_decomp(mult=2):
     plt.xlabel("Association")
     plt.legend()
     
-    df = DataFrame(dict(degree=deg, inliers=inliers, association=association))
+    df = pd.DataFrame(dict(degree=deg, inliers=inliers, association=association))
     plt.figure()
     sns.histplot(df[inliers == True], x='degree',label='Inliers')
     sns.histplot(df[inliers == False], x='degree',label='Outliers')
@@ -129,8 +118,7 @@ def study_graph_decomp(mult=2):
         print(f"{method}:  {fillin[-1]}")
     
     
-
-def run_scs(mult=2, warmstart=None):
+def test_warmstart_scs(mult=2):
     m = int(100*mult)
     n1 = int(100*mult)
     n2o = int(10*mult)
@@ -140,38 +128,119 @@ def run_scs(mult=2, warmstart=None):
     scs_params = PARAMS_SCS_DFLT
     scs_params['verbose']=True
     # Sparse solver    
-    inliers_s, t_setup_s, t_solve_s = prob.solve_scs_sparse(scs_params, warmstart)
+    _, _, t_solve_cold = prob.solve_scs_sparse(scs_params,warmstart=None)
+    # warmstart (full solution)
+    _, _, t_solve_warm = prob.solve_scs_sparse(scs_params, warmstart = "stored-xys")
+    # warmstart (just cone)
+    _, _, t_solve_warmcone = prob.solve_scs_sparse(scs_params, warmstart = "stored-y")
+    # Results
+    print(f"Runtime no warmstart: {t_solve_cold}")
+    print(f"Runtime full warmstart: {t_solve_warm}")
+    print(f"Runtime just cone: {t_solve_warmcone}")
     
-    print(f"Runtime: {t_solve_s}")
- 
-def speed_compare(mult = 2):
+def run_fusion_v2(mult=2, verbose = False):
     m = int(100*mult)
     n1 = int(100*mult)
     n2o = int(10*mult)
     prob = BunnyProb(m=m, n1=n1, n2o=n2o)
     
+    # Run fusion solver    
+    X, info = prob.cgraph.solve_fusion_v2(verbose=verbose)
+    inliers, er, x_opt = prob.cgraph.process_sdp_var(X)
+    
+    precision, recall = prob.get_prec_recall(inliers)
+    
+    output = dict(
+        inliers=inliers,
+        er=er,
+        t_setup=info['time_setup'],
+        t_solve=info['time_solve'],
+        precision=precision,
+        recall=recall
+    )
+    
+
+ 
+def run_scs(prob, warmstart=None):
+    
     # Set up SCS options
     scs_params = PARAMS_SCS_DFLT
-    # Enable multithreading
-    os.environ["OMP_NUM_THREADS"] = "30"  # Set to the number of desired threads
-    # Sparse solver    
-    inliers_s, t_setup_s, t_solve_s = prob.solve_scs_sparse(**scs_params)
-    # Non-sparse solver
-    inliers_c, time_c = prob.solve_clipper()
-    # Check difference between solutions
-    n_diff = np.sum(np.abs(inliers_c - inliers_s))
+    scs_params['verbose']=True
+    # Solve
+    X, info = prob.cgraph.solve_scs_sparse(setup_kwargs=scs_params, warmstart=warmstart)
+    # Process solution
+    inliers, er, x_opt = prob.cgraph.process_sdp_var(X)
+    precision, recall = prob.get_prec_recall(inliers)
     
-    s=f"""
-    Number of Associations: {m}
-    Number of inlier differences: {n_diff}
-    SCS Sparse:
-    Setup time: {t_setup_s}, Solve time {t_solve_s}
-    SCS Non-Sparse (CLIPPER):
-    Time: {time_c}
-    """
-    print(s)
+    output = dict(
+        solver="scs-sparse", 
+        size = prob.cgraph.size,
+        inliers=inliers,
+        er=er,
+        t_setup=info['time_setup'],
+        t_solve=info['time_solve'],
+        t_total = info['time_setup'] + info['time_solve'],
+        precision=precision,
+        recall=recall
+    )
+    
+    return output
+
+def run_scs_clipper(prob):
+    
+    # Solve
+    inliers, time = prob.solve_clipper()
+    precision, recall = prob.get_prec_recall(inliers)
+    
+    output = dict(
+        solver="scs-clipper",
+        size = prob.cgraph.size,
+        inliers=inliers,
+        er=None,
+        t_setup=None,
+        t_solve=None,
+        t_total = time,
+        precision=precision,
+        recall=recall
+    )
+    
+    return output
+ 
+def compare_sdps(mults = [2,3,4,5,6,7]):
+    
+    results = []
+    for mult in mults:
+        m = int(100*mult)
+        n1 = int(100*mult)
+        n2o = int(10*mult)
+        prob = BunnyProb(m=m, n1=n1, n2o=n2o)
+        print(f"Running with size {m}")
+        # Run Solvers
+        print("Sparse SDP...")
+        results.append(run_scs(prob=prob))
+        # Non-sparse solver
+        print("CLIPPER SDP...")
+        results.append(run_scs_clipper(prob=prob))
+
+    df = pd.DataFrame(results)
+    df.to_pickle('examples/results/sdp_comparison.pkl')
+    
+def compare_sdps_pp(filename='examples/results/sdp_comparison.pkl'):
+    df = pd.read_pickle(filename)
+    df.loc[df['solver']=='scs-sparse','size'] = np.array([200, 300,400,500,600,700])
+    
+    f, ax = plt.subplots(figsize=(7, 7))
+    ax.set(xscale="log", yscale="log")    
+    sns.lineplot(data=df, ax=ax, hue='solver',x='size', y='t_total')
+    plt.show()
  
 if __name__ == "__main__":
     # run_scs(mult=5)
     # run_scs(mult=5, warmstart="max-density")
-    study_graph_decomp()
+    # test_warmstart_scs(mult=5)
+    
+    # study_graph_decomp()
+    
+    # Comparison of SDP runtime
+    # compare_sdps()
+    compare_sdps_pp()

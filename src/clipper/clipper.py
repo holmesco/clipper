@@ -14,19 +14,21 @@ from time import time
 import scs
 
 class ConsistencyGraphProb():
-    def __init__(self, affinity):
+    def __init__(self, affinity, threshold=None):
         # Init affinity matrix
         if sp.issparse(affinity):
             self.affinity = affinity
         else:
             self.affinity = sp.csc_array(affinity)
+        if threshold is not None:
+            self.affinity = self.threshold_affinity(self.affinity, thresh=threshold)
         
         self.size = self.affinity.shape[0]
         # Run Symbolic Factorization
         self.symb_fact_affinity()
         
         # Mosek options
-        TOL = 1e-7
+        TOL = 1e-10
         self.options_cvxpy = {}
         self.options_cvxpy["mosek_params"] = {
             "MSK_IPAR_INTPNT_MAX_ITERATIONS": 500,
@@ -43,7 +45,19 @@ class ConsistencyGraphProb():
             "intpntSolveForm": "primal",  # has no effect
         }
     
-    
+    def threshold_affinity(self, thresh = 0.5):
+        """Threshold the affinity matrix"""
+        cols_thrsh, rows_thrsh = [], []
+        M = self.affinity
+        rows, cols = M.nonzero()
+        vals = M.data
+        for i in range(len(cols)):
+            if vals[i] >= thresh:
+                cols_thrsh.append(cols[i])
+                rows_thrsh.append(rows[i])
+            
+        M_thrsh = sp.csc_array((np.ones(len(cols_thrsh)),(rows_thrsh, cols_thrsh)), shape=M.shape)
+        return M_thrsh
         
     def get_affine_constraints(self):
         """Generate all affine constraints for the problem
@@ -153,73 +167,36 @@ class ConsistencyGraphProb():
         self.filled_pattern.eliminate_zeros()
         
         
-            
-    def solve_cvxpy(self, options=None, verbose = False):
-        """Solve the MSRC problem with CVXPY"""
-        if options is None:
-            options = self.options_cvxpy
-        
-        # Get the affinity matrix in sparse format
-        M = self.get_affinity_matrix()
-        n = M.shape[0]
-        if verbose:
-            print("Constructing CVXPY problem")
-        # Define vars
-        X = cp.Variable(M.shape, symmetric=True)
-        # PSD Constraint
-        constraints = [X >> 0]
-        # Add affine constraints   
-        eqs, ineqs= self.get_affine_constraints()
-        for A,b in eqs:
-            constraints.append(cp.trace(A @ X) + b == 0)
-        for A,b in ineqs:    
-            constraints.append(cp.trace(A @ X) + b >= 0)
-            
-        if verbose:
-            print("Solving...")
-            options["verbose"] = verbose
-        cprob = cp.Problem(cp.Maximize(cp.trace(M @ X)), constraints)
-        try:
-            cprob.solve(
-                solver="MOSEK",
-                **options,
-            )
-        except cp.SolverError as e:
-            cost = None
-            X = None
-            H = None
-            yvals = None
-            msg = f"infeasible / unknown: {e}"
-        else:
-            if np.isfinite(cprob.value):
-                cost = cprob.value
-                X = X.value
-                H = constraints[0].dual_value
-                yvals = [c.dual_value for c in constraints[1:]]
-                msg = "converged"
-            else:
-                cost = None
-                X = None
-                H = None
-                yvals = None
-                msg = "unbounded"
-                
-        return (X, H, yvals)
-    
-    def solve_fusion(self, options=None, verbose = False):
+    def solve_fusion(self, options=None, homog = False, regularize=False, verbose = False):
         """Solve the MSRC problem with Mosek Fusion"""
         if options is None:
             options = self.options_fusion
-        
         n = self.size
-        M = self.affinity
+        if homog:
+            size = n + 1
+        else:
+            size = n
+        
+        # Set up cost matrix
+        rows, cols = self.affinity.nonzero()
+        vals = self.affinity.data
+        if homog and regularize:
+            # Add regularizer for linear terms (in homogenization)
+            rows = list(rows)
+            cols = list(cols)
+            vals = list(vals)
+            rows += list(range(n)) +  n * [n]
+            cols += n * [n] + list(range(n))
+            vals += [0] * 2 * n
+        M = fu.Matrix.sparse(size, size, rows, cols, vals )
+        
         
         with fu.Model("dual") as mdl:
             if verbose:
                 print("Constructing Problem")
             t0 = time()
             # Create SDP variable
-            X = mdl.variable("X", fu.Domain.inPSDCone(n))
+            X = mdl.variable("X", fu.Domain.inPSDCone(size))
             # Add constriants
             for i in range(n):
                 for j in range(i,n):
@@ -232,20 +209,34 @@ class ConsistencyGraphProb():
                         vals = [0.5, 0.5]
                         rows = [i, j]
                         cols = [j, i]
-                    A = fu.Matrix.sparse(n, n, rows, cols, vals)
+                    A = fu.Matrix.sparse(size, size, rows, cols, vals)
                     # Each element of X is either zero or non-negative, depending on M
-                    if M[i,j] == 0:
+                    if self.affinity[i,j] == 0:
                         mdl.constraint(fu.Expr.dot(A, X), fu.Domain.equalsTo(0))
-                    else:
+                    elif not homog:
+                        # Enforce inequalities if not homogenizing
                         mdl.constraint(fu.Expr.dot(A, X), fu.Domain.greaterThan(0))
-            # Add Trace Constraint
-            # NOTE: Ineq below should be interchangeable with 
-            A = mat_fusion(sp.identity(n, format='csr'))
-            mdl.constraint(fu.Expr.dot(A, X), fu.Domain.lessThan(1))
-            # mdl.constraint(fu.Expr.dot(A, X), fu.Domain.equalsTo(1))
             
+            if homog:
+                # Implement inequalities as homogenizing constraints.
+                for i in range(n):
+                    rows = [i,n]
+                    cols = [n,i]
+                    vals = [0.5, 0.5]
+                    A = fu.Matrix.sparse(n+1,n+1, rows, cols,vals)
+                    mdl.constraint(fu.Expr.dot(A, X), fu.Domain.greaterThan(0))
+                
+                # Add Homogenizing constraint
+                A_h = fu.Matrix.sparse(n+1,n+1,[n],[n],[1])
+                mdl.constraint(fu.Expr.dot(A_h, X), fu.Domain.equalsTo(1))
+            # Add Trace Constraint
+            vals = np.ones(n)
+            inds = list(range(n))
+            A_tr = fu.Matrix.sparse(size, size, inds, inds, vals)
+            mdl.constraint(fu.Expr.dot(A_tr, X), fu.Domain.equalsTo(1))
+                       
             # Add affinity matrix objective
-            mdl.objective(fu.ObjectiveSense.Maximize, fu.Expr.dot(mat_fusion(M), X))
+            mdl.objective(fu.ObjectiveSense.Maximize, fu.Expr.dot(M, X))
 
             if verbose:
                 mdl.setLogHandler(sys.stdout)
@@ -263,8 +254,8 @@ class ConsistencyGraphProb():
                 fu.ProblemStatus.Unknown,
             ]:
                 cost = mdl.primalObjValue()
-                H = np.reshape(X.dual(), (n,n))
-                X = np.reshape(X.level(), (n,n))
+                H = np.reshape(X.dual(), (size,size))
+                X = np.reshape(X.level(), (size,size))
                 msg = f"success with status {mdl.getProblemStatus()}"
                 success = True
             else:
@@ -276,6 +267,84 @@ class ConsistencyGraphProb():
             info = {"success": success, "cost": cost, "msg": msg, "H": H, "time_setup":t1-t0, "time_solve":t2-t1}
             return X, info
     
+    def solve_eig(self,thresh):
+        
+        # Threshold the affinity matrix
+        n = self.size
+        M = self.threshold_affinity(thresh=thresh)
+        M.data += n
+    
+    def solve_fusion_v2(self, options=None, thresh=0.7, verbose=False):
+        """Alternative formulation of the problem from CLIPPER+, but homogenized to reduce the inequalities"""
+        if options is None:
+            options = self.options_fusion
+        
+        # Threshold the affinity matrix
+        aff_thresh = self.threshold_affinity(thresh=thresh)
+        # Construct dense cost matrix
+        n = self.size
+        M = -5*0*np.ones((n,n))
+        rows,cols = aff_thresh.nonzero()
+        M[rows,cols] = np.ones(len(rows))
+        # Pad with zeros
+        M_h = np.block([[M,np.zeros((n,1))], 
+                        [np.zeros((1,n)), np.zeros((1,1))]])
+    
+        # set up problem
+        with fu.Model("dual") as mdl:
+            if verbose:
+                print("Constructing Problem")
+            t0 = time()
+            # Create SDP variable
+            X = mdl.variable("X", fu.Domain.inPSDCone(n+1))
+            # Implement inequalities as homogenizing constraints.
+            for i in range(n):
+                rows = [i,n]
+                cols = [n,i]
+                vals = [0.5, 0.5]
+                A = fu.Matrix.sparse(n+1,n+1, rows, cols,vals)
+                mdl.constraint(fu.Expr.dot(A, X), fu.Domain.greaterThan(0))
+            # Homogenizing constraint
+            A_h = fu.Matrix.sparse(n+1,n+1,[n],[n],[1])
+            mdl.constraint(fu.Expr.dot(A_h, X), fu.Domain.equalsTo(1))
+            # Add Trace Constraint
+            vals = np.ones(n)
+            inds = list(range(n))
+            A_tr = fu.Matrix.sparse(n+1, n+1, inds, inds, vals)
+            mdl.constraint(fu.Expr.dot(A_tr, X), fu.Domain.equalsTo(1))
+            
+            # Add affinity matrix objective
+            mdl.objective(fu.ObjectiveSense.Maximize, fu.Expr.dot(mat_fusion(M_h), X))
+
+            if verbose:
+                mdl.setLogHandler(sys.stdout)
+                mdl.writeTask("problem_homog.ptf")
+
+            for key, val in options.items():
+                mdl.setSolverParam(key, val)
+
+            mdl.acceptedSolutionStatus(fu.AccSolutionStatus.Anything)
+            t1 = time()
+            mdl.solve()
+            t2 = time()
+            if mdl.getProblemStatus() in [
+                fu.ProblemStatus.PrimalAndDualFeasible,
+                fu.ProblemStatus.Unknown,
+            ]:
+                cost = mdl.primalObjValue()
+                H = np.reshape(X.dual(), (n+1,n+1))
+                X = np.reshape(X.level(), (n+1,n+1))
+                msg = f"success with status {mdl.getProblemStatus()}"
+                success = True
+            else:
+                cost = None
+                H = None
+                X = None
+                msg = f"solver failed with status {mdl.getProblemStatus()}"
+                success = False
+            info = {"success": success, "cost": cost, "msg": msg, "H": H, "time_setup":t1-t0, "time_solve":t2-t1}
+            return X, info
+        
 
     def solve_fusion_sparse(self, options=None, verbose = False):
         """Solve the MSRC problem with Mosek Fusion while exploiting sparsity."""
@@ -372,7 +441,7 @@ class ConsistencyGraphProb():
                     [0 -1  A_tr] [y_z] +  1 == 0
                     [ 0    A_z ]       +  0 == 0
         NOTE: We build At rather than A (using dual opt form)
-                    
+        NOTE: We assume here that edges correspond to the lower triangle of the affinity matrix   
         """
         # Generate clique information
         clq_sizes = [] # Size of each clique variable
@@ -393,7 +462,6 @@ class ConsistencyGraphProb():
         b = np.zeros(n_vars)
         Ap_rows, Ap_cols, Ap_data = [], [], []
         row_ind = 0
-        # NOTE: we assume here that edges correspond to the lower triangle of the affinity matrix
         for edge in self.edges:
             # Loop through cliques and add to sum
             for iClq, row_c, col_c in self.get_clique_inds(edge):
@@ -402,15 +470,15 @@ class ConsistencyGraphProb():
                     mult = 1
                 else:
                     mult = np.sqrt(2)
+                # Add to objective
+                # NOTE: Objective could also be defined on the positive cone vars
+                b[vec_ind + clq_start[iClq]+n_pos] += -mult * self.affinity[edge]    
                 # Get vectorized matrix index
                 vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
                 # Offset with clique starting index
                 Ap_cols.append(vec_ind + clq_start[iClq])
                 Ap_rows.append(row_ind)
                 Ap_data.append(mult)
-                # Add to objective
-                # NOTE: Objective could also be defined on the positive cone vars
-                b[vec_ind + clq_start[iClq]+n_pos] += -mult * self.affinity[edge]
             # increment row of At
             row_ind += 1
         # Build Ap matrix
@@ -464,40 +532,57 @@ class ConsistencyGraphProb():
     def compute_warmstart(self, cone, data, warmstart = "max-density"):
         """Compute warm start for SCS."""
         
-        # Get the index of the best clique
-        if warmstart == "max-density":
-            vals = []
-            for clique in self.cliques:
-                affinity_clique = self.affinity[np.ix_(clique,clique)]
-                vals.append(np.sum(affinity_clique.data))
-            best_clique_ind = np.argmax(vals)
-        elif warmstart == "max-clique":
-            best_clique_ind = np.argmax([len(clique) for clique in self.cliques])
         
-        # Generate the init SDP matrix by setting the variables of the best clique
-        y_sdp = []
-        for iClq, clique in enumerate(self.cliques):
-            if iClq == best_clique_ind:
-                X = np.ones((len(clique),len(clique)))
-                mask = self.affinity[np.ix_(clique,clique)] > 0
-                X = X * mask 
-                X = X.toarray() / len(clique) # divide by trace to normalize
-            else:
-                X = np.zeros((len(clique),len(clique)))
-            # Add to list
-            y_sdp.append(vec(X))
-        y_sdp = np.concatenate(y_sdp)
-        # Compute the other cone vars from the constraints
-        n_pos = cone['l']
-        A_p = data['A'].T[:n_pos, n_pos:]
-        y_p = data['c'][:n_pos,None] + (A_p @ y_sdp[:,None])
-        y = np.concatenate([y_p[:,0],y_sdp])
-        # Make param dict
-        solver_kwargs = dict(warm_start=True,
-                             x = None,
-                             y=y,
-                             s=None)
-        
+        if warmstart in ["max-density","max-clique"]:
+            # Get the index of the best clique
+            if warmstart == "max-density":
+                vals = []
+                for clique in self.cliques:
+                    affinity_clique = self.affinity[np.ix_(clique,clique)]
+                    vals.append(np.sum(affinity_clique.data))
+                best_clique_ind = np.argmax(vals)
+            elif warmstart == "max-clique":
+                best_clique_ind = np.argmax([len(clique) for clique in self.cliques])
+                
+                
+            # Generate the init SDP matrix by setting the variables of the best clique
+            y_sdp = []
+            for iClq, clique in enumerate(self.cliques):
+                if iClq == best_clique_ind:
+                    X = np.ones((len(clique),len(clique)))
+                    mask = self.affinity[np.ix_(clique,clique)] > 0
+                    X = X * mask 
+                    X = X.toarray() / len(clique) # divide by trace to normalize
+                else:
+                    X = np.zeros((len(clique),len(clique)))
+                # Add to list
+                y_sdp.append(vec(X))
+            y_sdp = np.concatenate(y_sdp)
+            # Compute the other cone vars from the constraints
+            n_pos = cone['l']
+            A_p = data['A'].T[:n_pos, n_pos:]
+            y_p = data['c'][:n_pos,None] + (A_p @ y_sdp[:,None])
+            y = np.concatenate([y_p[:,0],y_sdp])
+            # Make param dict
+            solver_kwargs = dict(warm_start=True,
+                                x = None,
+                                y=y,
+                                s=None)
+        elif warmstart == "stored-xys":
+            # Make param dict
+            solver_kwargs = dict(warm_start=True,**self.stored_soln)
+        elif warmstart == "stored-y":
+            solver_kwargs = dict(warm_start=True,
+                                x = 0*self.stored_soln['x'],
+                                y=self.stored_soln['y'],
+                                s = 0*self.stored_soln['s'],
+                                )
+        else:
+            solver_kwargs = dict(warm_start=False,
+                                x = None,
+                                y=None,
+                                s=None)
+            
         return solver_kwargs
         
             
@@ -547,6 +632,9 @@ class ConsistencyGraphProb():
         info = dict(**sol)
         info['time_setup'] = t1 - t0
         info['time_solve'] = t2 - t1
+        # cache solution for warmstart
+        self.stored_soln=dict(x=sol['x'], y=sol['y'], s=sol['s'])
+        
         return X, info
         
         
@@ -570,15 +658,21 @@ class ConsistencyGraphProb():
         return var_list
         
     
-    def process_sdp_var(self, X):
+    def process_sdp_var(self, X, homog=False):
         # Decompose SDP solution
         evals, evecs = np.linalg.eigh(X)
         er = evals[-1] / evals[-2]
         x_opt = evecs[:,-1] * np.sqrt(evals[-1])
-        
+        if homog:
+            if x_opt[-1] < 0:
+                x_sol = -x_opt[:-1]
+            else:
+                x_sol = x_opt[:-1]
+        else:
+            x_sol= x_opt
         # Select inliers
-        thresh = np.max(x_opt) / 2
-        inliers = (x_opt > thresh).astype(float)
+        thresh = np.max(x_sol) / 2
+        inliers = (x_sol > thresh).astype(float)
         
         return inliers, er, x_opt
 

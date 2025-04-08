@@ -9,8 +9,9 @@ import unittest
 from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, mat2vec_ind
 
 class TestClipper(unittest.TestCase):
-    def __init__(self, test_prob = "three-clique"):
+    def __init__(self, test_prob = "three-clique",seed=0):
         self.test_prob = test_prob
+        np.random.seed(seed)
         if test_prob == "bunny":
             self.init_bunny_test()
         elif test_prob == "two-clique":
@@ -90,12 +91,33 @@ class TestClipper(unittest.TestCase):
         self.assertIsInstance(yvals, list)
 
     def test_solve_fusion(self):
-        X, info = self.prob.solve_fusion(verbose=True)
+        # Check that solution is correct
+        X, info = self.prob.solve_fusion(verbose=True,homog=False)
+        self.assertIsNotNone(X)
+        self.assertIn("success", info)
+        self.assertTrue(info["success"])
+        self.check_solution(X,homog=False)
+        
+        # Check solution when homogenizing
+        X_h, info_h = self.prob.solve_fusion(verbose=True,homog=True)
+        self.assertIsNotNone(X_h)
+        self.assertIn("success", info_h)
+        self.assertTrue(info_h["success"])
+        self.check_solution(X_h,homog=True)
+        
+        # Compare homogenized and non-homogenized solutions
+        
+        
+        
+    
+    def test_solve_fusion_v2(self):
+        X, info = self.prob.solve_fusion_v2(verbose=True)
         self.assertIsNotNone(X)
         self.assertIn("success", info)
         self.assertTrue(info["success"])
         
         self.check_solution(X)
+    
     
     def test_scs_setup(self):
         cone, data = self.prob.get_scs_setup()
@@ -164,10 +186,10 @@ class TestClipper(unittest.TestCase):
         self.assertTrue(info["success"])
         self.check_solution(X)
         
-    def check_solution(self, X):
+    def check_solution(self, X, homog=False):
         """Check that solution is rank 1 and that the solution matches what we expect."""
         # Process solution
-        inliers, er, x_opt = self.prob.process_sdp_var(X)
+        inliers, er, x_opt = self.prob.process_sdp_var(X, homog=homog)
         # Check ER
         assert er > 1e6, ValueError("Solution not rank-1")
         
@@ -187,10 +209,11 @@ class TestClipper(unittest.TestCase):
 if __name__ == "__main__":
     test = TestClipper(test_prob="bunny")
     # test.test_affine_constraints()
-    # test.test_solve_fusion()
+    test.test_solve_fusion()
     # test.test_symb_fact(plot=False)
     # test.test_solve_fusion()
     # test.test_solve_fusion_sparse()
     # test.test_scs_setup()
     # test.test_mat2vec_ind()
-    test.test_solve_scs()
+    # test.test_solve_scs()
+    # test.test_solve_fusion_v2()
