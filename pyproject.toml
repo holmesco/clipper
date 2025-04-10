@@ -22,7 +22,10 @@ dependencies = [
     "chompack",
     "networkx",
     "line_profiler",
+    "seaborn",
+    "pandas",
     "pip",
+    "diffcp",
 ]
 
 [tool.setuptools]

@@ -13,11 +13,13 @@ import chompack
 from time import time
 import scs
 
+from src.clipper.rank_reduction import rank_reduction
+
 class ConsistencyGraphProb():
     def __init__(self, affinity, threshold=None):
         # Init affinity matrix
         if sp.issparse(affinity):
-            self.affinity = affinity
+            self.affinity =affinity
         else:
             self.affinity = sp.csc_array(affinity)
         if threshold is not None:
@@ -167,7 +169,7 @@ class ConsistencyGraphProb():
         self.filled_pattern.eliminate_zeros()
         
         
-    def solve_fusion(self, options=None, homog = False, regularize=False, verbose = False):
+    def solve_fusion(self, options=None, dense_cost = False, homog = False, threshold=0.0, regularize=False, verbose = False):
         """Solve the MSRC problem with Mosek Fusion"""
         if options is None:
             options = self.options_fusion
@@ -178,19 +180,47 @@ class ConsistencyGraphProb():
             size = n
         
         # Set up cost matrix
-        rows, cols = self.affinity.nonzero()
-        vals = self.affinity.data
-        if homog and regularize:
+        M = self.affinity
+        
+        if dense_cost and threshold == 0:
+            threshold=0.5
+            
+        if threshold > 0:
+            M = self.threshold_affinity(thresh=threshold)
+        
+        # Get sparse data for M
+        rows, cols = M.nonzero()
+        vals = M.data
+        rows = list(rows)
+        cols = list(cols)
+        vals = list(vals)
+        
+        if dense_cost:
+            # Construct dense cost matrix
+            n = self.size
+            M_d = -n*np.ones((n,n))
+            M_d[rows,cols] = np.ones(len(rows))
+            # Pad with zeros if homogenizing
+            if homog and regularize:
+                M = np.block([[M_d,2*n*np.ones((n,1))], 
+                            [2*n*np.ones((1,n)), np.zeros((1,1))]])
+            elif homog:
+                M = np.block([[M_d,np.zeros((n,1))], 
+                            [np.zeros((1,n)), np.zeros((1,1))]])
+            else:
+                M = M_d
+        elif homog and regularize:              
             # Add regularizer for linear terms (in homogenization)
-            rows = list(rows)
-            cols = list(cols)
-            vals = list(vals)
             rows += list(range(n)) +  n * [n]
             cols += n * [n] + list(range(n))
-            vals += [0] * 2 * n
-        M = fu.Matrix.sparse(size, size, rows, cols, vals )
-        
-        
+            vals += [1] * 2 * n
+            M = fu.Matrix.sparse(size, size, rows, cols, vals )
+        else: 
+            M = fu.Matrix.sparse(size, size, rows, cols, vals )
+            
+        constraints=[]        
+        clist = []
+        ineq = []
         with fu.Model("dual") as mdl:
             if verbose:
                 print("Constructing Problem")
@@ -211,11 +241,18 @@ class ConsistencyGraphProb():
                         cols = [j, i]
                     A = fu.Matrix.sparse(size, size, rows, cols, vals)
                     # Each element of X is either zero or non-negative, depending on M
-                    if self.affinity[i,j] == 0:
-                        mdl.constraint(fu.Expr.dot(A, X), fu.Domain.equalsTo(0))
+                    # Equalities not required if dense cost is used
+                    if self.affinity[i,j] == 0 and not dense_cost:
+                        constr = mdl.constraint(fu.Expr.dot(A, X), fu.Domain.equalsTo(0))
+                        clist.append(constr)
+                        constraints.append(sp.csr_array((vals,(rows,cols)), shape=(size,size)))
+                        ineq.append(False)
                     elif not homog:
-                        # Enforce inequalities if not homogenizing
-                        mdl.constraint(fu.Expr.dot(A, X), fu.Domain.greaterThan(0))
+                        # Enforce inequalities on variables if not homogenizing
+                        constr = mdl.constraint(fu.Expr.dot(A, X), fu.Domain.greaterThan(0))
+                        clist.append(constr)
+                        constraints.append(sp.csr_array((vals,(rows,cols)), shape=(size,size)))
+                        ineq.append(True)
             
             if homog:
                 # Implement inequalities as homogenizing constraints.
@@ -223,18 +260,26 @@ class ConsistencyGraphProb():
                     rows = [i,n]
                     cols = [n,i]
                     vals = [0.5, 0.5]
-                    A = fu.Matrix.sparse(n+1,n+1, rows, cols,vals)
-                    mdl.constraint(fu.Expr.dot(A, X), fu.Domain.greaterThan(0))
-                
+                    A = fu.Matrix.sparse(size,size, rows, cols,vals)
+                    constr = mdl.constraint(fu.Expr.dot(A, X), fu.Domain.greaterThan(0))
+                    clist.append(constr)
+                    constraints.append(sp.csr_array((vals,(rows,cols)), shape=(size,size)))
+                    ineq.append(True)
+                    
                 # Add Homogenizing constraint
-                A_h = fu.Matrix.sparse(n+1,n+1,[n],[n],[1])
-                mdl.constraint(fu.Expr.dot(A_h, X), fu.Domain.equalsTo(1))
+                A_h = fu.Matrix.sparse(size,size,[n],[n],[1])
+                clist.append(constr)
+                constr = mdl.constraint(fu.Expr.dot(A_h, X), fu.Domain.equalsTo(1))
+                constraints.append(sp.csr_array(([1],([n],[n])), shape=(size,size)))
+                ineq.append(False)
             # Add Trace Constraint
             vals = np.ones(n)
             inds = list(range(n))
             A_tr = fu.Matrix.sparse(size, size, inds, inds, vals)
-            mdl.constraint(fu.Expr.dot(A_tr, X), fu.Domain.equalsTo(1))
-                       
+            constr = mdl.constraint(fu.Expr.dot(A_tr, X), fu.Domain.equalsTo(1))
+            clist.append(constr) 
+            constraints.append(sp.csr_array((vals,(inds,inds)), shape=(size,size)))
+            ineq.append(False)   
             # Add affinity matrix objective
             mdl.objective(fu.ObjectiveSense.Maximize, fu.Expr.dot(M, X))
 
@@ -256,6 +301,7 @@ class ConsistencyGraphProb():
                 cost = mdl.primalObjValue()
                 H = np.reshape(X.dual(), (size,size))
                 X = np.reshape(X.level(), (size,size))
+                mults = [c.dual() for c in clist]
                 msg = f"success with status {mdl.getProblemStatus()}"
                 success = True
             else:
@@ -264,88 +310,21 @@ class ConsistencyGraphProb():
                 X = None
                 msg = f"solver failed with status {mdl.getProblemStatus()}"
                 success = False
-            info = {"success": success, "cost": cost, "msg": msg, "H": H, "time_setup":t1-t0, "time_solve":t2-t1}
+                mults=None
+            info = {
+                "success": success,
+                "cost": cost,
+                "msg": msg,
+                "H": H,
+                "time_setup":t1-t0,
+                "time_solve":t2-t1,
+                "constraints":constraints,
+                "mults":mults,
+                "ineq":ineq,
+                }
             return X, info
     
-    def solve_eig(self,thresh):
-        
-        # Threshold the affinity matrix
-        n = self.size
-        M = self.threshold_affinity(thresh=thresh)
-        M.data += n
-    
-    def solve_fusion_v2(self, options=None, thresh=0.7, verbose=False):
-        """Alternative formulation of the problem from CLIPPER+, but homogenized to reduce the inequalities"""
-        if options is None:
-            options = self.options_fusion
-        
-        # Threshold the affinity matrix
-        aff_thresh = self.threshold_affinity(thresh=thresh)
-        # Construct dense cost matrix
-        n = self.size
-        M = -5*0*np.ones((n,n))
-        rows,cols = aff_thresh.nonzero()
-        M[rows,cols] = np.ones(len(rows))
-        # Pad with zeros
-        M_h = np.block([[M,np.zeros((n,1))], 
-                        [np.zeros((1,n)), np.zeros((1,1))]])
-    
-        # set up problem
-        with fu.Model("dual") as mdl:
-            if verbose:
-                print("Constructing Problem")
-            t0 = time()
-            # Create SDP variable
-            X = mdl.variable("X", fu.Domain.inPSDCone(n+1))
-            # Implement inequalities as homogenizing constraints.
-            for i in range(n):
-                rows = [i,n]
-                cols = [n,i]
-                vals = [0.5, 0.5]
-                A = fu.Matrix.sparse(n+1,n+1, rows, cols,vals)
-                mdl.constraint(fu.Expr.dot(A, X), fu.Domain.greaterThan(0))
-            # Homogenizing constraint
-            A_h = fu.Matrix.sparse(n+1,n+1,[n],[n],[1])
-            mdl.constraint(fu.Expr.dot(A_h, X), fu.Domain.equalsTo(1))
-            # Add Trace Constraint
-            vals = np.ones(n)
-            inds = list(range(n))
-            A_tr = fu.Matrix.sparse(n+1, n+1, inds, inds, vals)
-            mdl.constraint(fu.Expr.dot(A_tr, X), fu.Domain.equalsTo(1))
-            
-            # Add affinity matrix objective
-            mdl.objective(fu.ObjectiveSense.Maximize, fu.Expr.dot(mat_fusion(M_h), X))
-
-            if verbose:
-                mdl.setLogHandler(sys.stdout)
-                mdl.writeTask("problem_homog.ptf")
-
-            for key, val in options.items():
-                mdl.setSolverParam(key, val)
-
-            mdl.acceptedSolutionStatus(fu.AccSolutionStatus.Anything)
-            t1 = time()
-            mdl.solve()
-            t2 = time()
-            if mdl.getProblemStatus() in [
-                fu.ProblemStatus.PrimalAndDualFeasible,
-                fu.ProblemStatus.Unknown,
-            ]:
-                cost = mdl.primalObjValue()
-                H = np.reshape(X.dual(), (n+1,n+1))
-                X = np.reshape(X.level(), (n+1,n+1))
-                msg = f"success with status {mdl.getProblemStatus()}"
-                success = True
-            else:
-                cost = None
-                H = None
-                X = None
-                msg = f"solver failed with status {mdl.getProblemStatus()}"
-                success = False
-            info = {"success": success, "cost": cost, "msg": msg, "H": H, "time_setup":t1-t0, "time_solve":t2-t1}
-            return X, info
-        
-
+   
     def solve_fusion_sparse(self, options=None, verbose = False):
         """Solve the MSRC problem with Mosek Fusion while exploiting sparsity."""
         if options is None:
@@ -657,12 +636,25 @@ class ConsistencyGraphProb():
         
         return var_list
         
+    def reduce_rank(self, X, info, tol = 1e-5):
+        """Apply rank reduction to solution"""
+        # Get binding constraints
+        constraints, ineq, mults = info["constraints"],info["ineq"],info["mults"]
+        binding_constraints = []
+        for i in range(len(constraints)):
+            if not ineq[i] or (ineq[i] and np.abs(mults[i]) > tol):
+                binding_constraints.append(constraints[i])
+
+        V = rank_reduction(binding_constraints, X, null_tol = tol)
+        return V
     
     def process_sdp_var(self, X, homog=False):
+        """Post process SDP variable into an actual solution."""
         # Decompose SDP solution
         evals, evecs = np.linalg.eigh(X)
         er = evals[-1] / evals[-2]
         x_opt = evecs[:,-1] * np.sqrt(evals[-1])
+    
         if homog:
             if x_opt[-1] < 0:
                 x_sol = -x_opt[:-1]
