@@ -7,9 +7,10 @@ import matplotlib.pyplot as plt
 import unittest
 
 from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, mat2vec_ind, PARAMS_SCS_DFLT
+from src.clipper.rank_reduction import get_low_rank_factor
 
 class TestClipper(unittest.TestCase):
-    def __init__(self, test_prob = "three-clique",seed=0):
+    def __init__(self, test_prob = "three-clique",seed=0, threshold=0):
         self.test_prob = test_prob
         np.random.seed(seed)
         if test_prob == "bunny":
@@ -20,7 +21,7 @@ class TestClipper(unittest.TestCase):
             self.three_clique_test()
         
         # Define problem
-        self.prob = ConsistencyGraphProb(self.affinity)
+        self.prob = ConsistencyGraphProb(self.affinity, threshold=threshold)
         self.size = self.affinity.shape[0]
 
     def two_clique_test(self):
@@ -46,7 +47,7 @@ class TestClipper(unittest.TestCase):
         self.m = 100
         self.n1 = 100
         self.n2o = 10
-        self.outrat = 0.9
+        self.outrat = 0.1
         self.sigma = 0.01
         self.pcfile = 'examples/data/bun10k.ply'
         self.T_21 = np.eye(4)
@@ -166,11 +167,17 @@ class TestClipper(unittest.TestCase):
         scs_params = PARAMS_SCS_DFLT
         scs_params['verbose']=True
         X, info = self.prob.solve_scs_sparse(setup_kwargs=scs_params, homog=True)
+        # Retrieve dual solution
+        H_c_list, H = self.prob.get_dual_sol(info, homog=True)
+        
         # Add constraint info
         info['constraints'] = self.prob.get_affine_constraints_homog()
         # # Process to get low rank factor
         V = self.prob.reduce_rank(X, info)
         X_h_r = V @ V.T
+        # V = get_low_rank_factor(X)
+        # v = V[:,[0]] + V[:,[1]]
+        
         self.check_solution(X_h_r, homog=True)
 
     
@@ -213,6 +220,16 @@ class TestClipper(unittest.TestCase):
         self.assertTrue(info["success"])
         self.check_solution(X)
         
+    def test_fusion_dual_homog(self):
+        
+        # SDP Cone
+        H, info = self.prob.solve_fusion_dual_homog(verbose=True)
+        # DD Cone
+        H, info = self.prob.solve_fusion_dual_homog(verbose=True, cone="DD")
+        
+        print('done')
+        
+        
     def check_solution(self, X, homog=False):
         """Check that solution is rank 1 and that the solution matches what we expect."""
         # Process solution
@@ -234,7 +251,7 @@ class TestClipper(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    test = TestClipper(test_prob="three-clique")
+    test = TestClipper(test_prob="bunny", threshold=0.5)
     # test.test_affine_constraints()
     # test.test_solve_fusion()
     # test.test_solve_fusion_dense()
@@ -244,4 +261,5 @@ if __name__ == "__main__":
     # test.test_scs_setup()
     # test.test_mat2vec_ind()
     # test.test_solve_scs()
-    test.test_solve_scs_homog()
+    # test.test_solve_scs_homog()
+    test.test_fusion_dual_homog()

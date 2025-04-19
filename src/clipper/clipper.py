@@ -5,7 +5,7 @@ from scipy.spatial.transform import Rotation
 from scipy.special import gammainc
 import matplotlib.pyplot as plt
 import cvxpy as cp
-import mosek.fusion as fu
+import mosek.fusion.pythonic as fu
 import scipy.sparse as sp
 import clipperpy
 from cvxopt import amd, spmatrix, matrix
@@ -18,11 +18,69 @@ from src.clipper.rank_reduction import rank_reduction
 PARAMS_SCS_DFLT = dict(max_iters = 2000,
                       acceleration_interval = 10,
                       acceleration_lookback= 10,
-                      eps_abs = 1e-3,
-                      eps_rel = 1e-3,
+                      eps_abs = 1e-5,
+                      eps_rel = 1e-5,
                       eps_infeas=1e-7,
                       time_limit_secs=0,
                       verbose = False)
+
+class DDConeVar():
+    """Implements diagonally dominant cone variable for mosek fusion"""
+    def __init__(self, mdl, dim, name="dd"):
+        assert isinstance(mdl, fu.Model), ValueError("Must provide fusion model to define DDConVar")
+        self.dim = dim # Dimension of matrix
+        self.shape = (dim, dim)
+        self.mdl = mdl # Model
+        vecsize = int(dim * (dim+1)/2)
+        # Variable representing matrix
+        self.vecvar = mdl.variable(name, vecsize)
+        # Variable represeting absolute value of matrix element
+        # TODO: We only need off-diagonals here, but it complicates the functions. For now just define extra elements
+        self.vecvar_abs = mdl.variable(name+f"_abs", vecsize) 
+        # Generate constraints for DD
+        self.generate_constraints()
+    
+    def generate_constraints(self):
+        "Generate diagonal dominant constraints"
+        for i in range(self.dim):
+            sum_abs_list = []
+            for j in range(self.dim):
+                if i > j:
+                    z_ij = self.vecvar_abs.index(mat2vec_ind(self.dim, i, j))
+                    # absolute value constraints 
+                    self.mdl.constraint(f"ap_{i}_{j}", self.index(i,j) + z_ij, fu.Domain.greaterThan(0.0))
+                    self.mdl.constraint(f"am_{i}_{j}", self.index(i,j) - z_ij, fu.Domain.lessThan(0.0))
+                elif j > i:
+                    z_ij = self.vecvar_abs.index(mat2vec_ind(self.dim, j, i))
+                else:
+                    continue
+                # Add to sum
+                sum_abs_list.append(z_ij)
+            # Add diag dom constraint
+            self.mdl.constraint(f"dd_{i}", self.index(i,i) - fu.Expr.add(sum_abs_list), fu.Domain.greaterThan(0.0))
+    
+    def level(self):
+        """Return level value in matrix form"""
+        values = self.vecvar.level()
+        mat = np.zeros(self.shape)
+        # Fill lower triangle
+        cols, rows = np.triu_indices(self.dim)
+        mat[rows, cols] = values
+        mat[range(self.dim),range(self.dim)] /= 2
+        
+        return mat + mat.T
+        
+                
+                
+    def index(self, i, j):
+        """Return the Mosek variable at the given index. Assume lower triangular"""
+        if i < j:
+            row, col = j, i
+        else:
+            row, col = i, j
+        ind = mat2vec_ind(self.dim, row, col)
+        
+        return self.vecvar.index(ind)
 
 class ConsistencyGraphProb():
     def __init__(self, affinity, threshold=None):
@@ -32,7 +90,7 @@ class ConsistencyGraphProb():
         else:
             self.affinity = sp.csc_array(affinity)
         if threshold is not None:
-            self.affinity = self.threshold_affinity(self.affinity, thresh=threshold)
+            self.affinity = self.threshold_affinity(thresh=threshold)
         
         self.size = self.affinity.shape[0]
         # Run Symbolic Factorization
@@ -166,7 +224,7 @@ class ConsistencyGraphProb():
         # Convert adjacency to sparsity pattern
         rows, cols = self.affinity.nonzero()
         # NOTE: only store edges on lower triangle to avoid double counting
-        self.edges = [tuple([rows[i], cols[i]]) for i in range(len(rows)) if rows[i]>=cols[i]]
+        self.edges = list(zip(*sp.tril(self.affinity).nonzero()))
         self.pattern = spmatrix(1.0, rows, cols, self.affinity.shape)
         # get information from factorization
         if merge_func == "cosmo":
@@ -265,7 +323,7 @@ class ConsistencyGraphProb():
         constraints=[]        
         clist = []
         ineq = []
-        with fu.Model("dual") as mdl:
+        with fu.Model("primal") as mdl:
             if verbose:
                 print("Constructing Problem")
             t0 = time()
@@ -368,7 +426,92 @@ class ConsistencyGraphProb():
                 }
             return X, info
     
-   
+    def solve_fusion_dual_homog(self, options=None, cone='SDP', verbose=False):
+        """Solve the homogenized dual problem using different cone approximations"""
+        # Get options
+        if options is None:
+            options = self.options_fusion
+        n = self.size+1
+        with fu.Model("Dual") as mdl:
+            # Construct Model with specified cone
+            if cone == "SDP":
+                H = mdl.variable("X", fu.Domain.inPSDCone(n))
+            elif cone == "DD":
+                H = DDConeVar(mdl=mdl, dim=n)
+            elif cone == "SDD":
+                raise NotImplemented()
+            else:
+                raise ValueError("cone input not recognized")
+            # Define homogenization and trace constraint multipliers.
+            lambda_t = mdl.variable("l_t")
+            lambda_h = mdl.variable("l_h")
+            # Define inequality constraint multipliers
+            mu = mdl.variable("mu", self.size,fu.Domain.greaterThan(0.0))            
+            lambda_ij = []
+            for i in range(self.size):
+                # Add affinity matrix constraints
+                for j in range(i,self.size):
+                    if i == j:
+                        # Diagonals always have trace constraint multiplier
+                        value = lambda_t - self.affinity[i,i]
+                    elif j > i:
+                        # Off diagonals have multiplier only if affinity is zero
+                        if self.affinity[i,j] == 0:
+                            lambda_ij.append(mdl.variable(f"lam_{i}_{j}"))
+                            value = lambda_ij[-1]
+                        else:
+                            # Otherwise just use affinity value
+                            value = -self.affinity[i,j]
+                    mdl.constraint(f"elem_{i}_{j}", H.index(i,j)-value, fu.Domain.equalsTo(0))
+                # Inequality constraint multipliers
+                mdl.constraint(f"ineq_{i}", H.index(i,self.size)+mu[i], fu.Domain.equalsTo(0))
+            # Homogenizing Constraint
+            mdl.constraint(f"homog", H.index(self.size, self.size)-lambda_h, fu.Domain.equalsTo(0))
+            # Gather variables
+            variables = [mu] + [lambda_h] + [lambda_t] + lambda_ij
+            # Define objective
+            mdl.objective(fu.ObjectiveSense.Minimize, lambda_t + lambda_h)
+            
+            if verbose:
+                mdl.setLogHandler(sys.stdout)
+                mdl.writeTask(f"dual_homog_{cone}.ptf")
+
+            for key, val in options.items():
+                mdl.setSolverParam(key, val)
+
+            mdl.acceptedSolutionStatus(fu.AccSolutionStatus.Anything)
+            mdl.solve()
+            if mdl.getProblemStatus() in [
+                fu.ProblemStatus.PrimalAndDualFeasible,
+                fu.ProblemStatus.Unknown,
+            ]:
+                cost = mdl.primalObjValue()
+                if cone == "SDP":
+                    X = np.reshape(H.dual(), (n,n))
+                    H = np.reshape(H.level(), (n,n))
+                elif cone == "DD":
+                    X = None
+                    H = H.level()
+                mults = [var.level() for var in variables]
+                msg = f"success with status {mdl.getProblemStatus()}"
+                success = True
+            else:
+                cost = None
+                H = None
+                X = None
+                msg = f"solver failed with status {mdl.getProblemStatus()}"
+                success = False
+                mults=None
+            info = {
+                "success": success,
+                "cost": cost,
+                "msg": msg,
+                "H": H,
+                "mults":mults,
+                }
+            return H, info
+                        
+            
     def solve_fusion_sparse(self, options=None, verbose = False):
         """Solve the MSRC problem with Mosek Fusion while exploiting sparsity."""
         if options is None:
@@ -786,13 +929,41 @@ class ConsistencyGraphProb():
         # cache solution for warmstart
         self.stored_soln=dict(x=sol['x'], y=sol['y'], s=sol['s'])
         # Add information
-        info['mults'] = sol['x']
+        info['mults'] = np.concatenate([sol['s'][:cone['l']], sol['x'][cone['l']:]])
         info['ineq'] = np.zeros(data['A'].shape[1])
         info['ineq'][:cone['l']] = 1
-
+        info['cone'] = cone
+        info['data'] = data
+        
         return X, info
         
+    def get_dual_sol(self, info, homog=False):
+        """Retrieve the dual matrix solutions"""
+        # Get problem data
+        cone, data = info['cone'], info['data']
+        # Retrieve dual matrices
+        if homog:
+            mat_shape = (self.size+1,self.size+1)
+        else:
+            mat_shape = (self.size,self.size)    
+        H = np.zeros(mat_shape)
+        H_c_list=[]  
+        start_ind = cone['l']
+        for clique_inds in self.cliques:
+            inds = clique_inds
+            if homog:
+                size = len(clique_inds)+1
+                inds = clique_inds.copy()
+                inds.append(self.size)
+            else:
+                size = len(clique_inds)
+            vec_size = int((size+1)*size/2)
+            H_c_list.append(mat(info['s'][start_ind: start_ind+vec_size]))
+            H[np.ix_(inds, inds)] = H_c_list[-1]
+            start_ind += vec_size
         
+        return H_c_list, H
+    
     def get_clique_inds(self, edge):
         """Find all cliques that contain a given edge in the graph. Return tuple of variable indices in the form: (Clique index, row index, column index) """
         # Find the cliques that include the edge
@@ -814,12 +985,16 @@ class ConsistencyGraphProb():
         
     def reduce_rank(self, X, info, tol = 1e-5):
         """Apply rank reduction to solution"""
-        # Get binding constraints
+        # Figure out which constraints are binding
         constraints, ineq, mults = info["constraints"],info["ineq"],info["mults"]
         binding_constraints = []
-        for i in range(len(constraints)):
-            if not ineq[i] or np.abs(mults[i]) > tol:
+        for i, A in enumerate(constraints):
+            if not ineq[i]:
                 binding_constraints.append(constraints[i])
+            else:
+                # Check if constraint is binding
+                if np.trace(A @ X) < tol:
+                    binding_constraints.append(constraints[i])
 
         V = rank_reduction(binding_constraints, X, null_tol = tol)
         return V
@@ -858,30 +1033,11 @@ def mat(s):
     """Convert matrix in half vectorized form into a symmetric matrix
     Assume that the vector has more columns than rows.
     """
-    if sp.issparse(s):
-        vecsize = max(s.shape)
-        matsize = int((np.sqrt(8 * vecsize + 1) - 1) / 2)
-        _, vec_inds = s.nonzero()
-        rows, cols, vals = [],[],[]
-        for vecind in vec_inds:
-            row, col = vech_index_to_lower_triangular(vecind, vecsize)
-            if row == col:
-                rows.append(row)
-                cols.append(col)
-                vals.append(s[vecind])
-            else:
-                rows.append([row, col])
-                cols.append([col, row])
-                val = s[vecind] / np.sqrt(2)
-                vals.append([val, val])
-        S = sp.csr_matrix((vals, (rows, cols)), (matsize, matsize))
-        
-    else:    
-        n = int((np.sqrt(8 * len(s) + 1) - 1) / 2)
-        S = np.zeros((n, n))
-        S[np.triu_indices(n)] = s / np.sqrt(2)
-        S = S + S.T
-        S[range(n), range(n)] /= np.sqrt(2)
+    n = int((np.sqrt(8 * len(s) + 1) - 1) / 2)
+    S = np.zeros((n, n))
+    S[np.triu_indices(n)] = s / np.sqrt(2)
+    S = S + S.T
+    S[range(n), range(n)] /= np.sqrt(2)
     return S
 
 def mat2vec_ind(n, row, col):
