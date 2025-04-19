@@ -223,9 +223,11 @@ class TestClipper(unittest.TestCase):
     def test_fusion_dual_homog(self):
         
         # SDP Cone
-        H, info = self.prob.solve_fusion_dual_homog(verbose=True)
+        H_sdp, info_sdp = self.prob.solve_fusion_dual_homog(verbose=True)
         # DD Cone
-        H, info = self.prob.solve_fusion_dual_homog(verbose=True, cone="DD")
+        H_dd, info_dd = self.prob.solve_fusion_dual_homog(verbose=True, cone="DD")
+        # SDD Cone
+        H_sdd, info_sdd = self.prob.solve_fusion_dual_homog(verbose=True, cone="SDD")
         
         print('done')
         
@@ -251,7 +253,7 @@ class TestClipper(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    test = TestClipper(test_prob="bunny", threshold=0.5)
+    test = TestClipper(test_prob="two-clique", threshold=0.5)
     # test.test_affine_constraints()
     # test.test_solve_fusion()
     # test.test_solve_fusion_dense()

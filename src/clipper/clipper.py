@@ -69,19 +69,88 @@ class DDConeVar():
         mat[range(self.dim),range(self.dim)] /= 2
         
         return mat + mat.T
-        
-                
-                
+    
     def index(self, i, j):
-        """Return the Mosek variable at the given index. Assume lower triangular"""
-        if i < j:
-            row, col = j, i
-        else:
-            row, col = i, j
-        ind = mat2vec_ind(self.dim, row, col)
-        
-        return self.vecvar.index(ind)
+            """Return the Mosek variable at the given index. Assume lower triangular"""
+            if i < j:
+                row, col = j, i
+            else:
+                row, col = i, j
+            ind = mat2vec_ind(self.dim, row, col)
+            
+            return self.vecvar.index(ind)
+    
+class SDDConeVar():
+    """Implements scaled diagonally dominant cone variable for mosek fusion"""
+    def __init__(self, mdl, dim, name="sdd"):
+        assert isinstance(mdl, fu.Model), ValueError("Must provide fusion model to define DDConVar")
+        self.dim = dim # Dimension of matrix
+        self.shape = (dim, dim)
+        self.mdl = mdl # Model
+        vecsize = int(dim * (dim+1)/2)
+        # Variable representing matrix
+        self.vecvar = mdl.variable(name, vecsize)
+        # Principle Minor Matrices (dim choose 2)
+        # NOTE: M = [a b ; b c] then cone order is (a, c, b)
+        n_pmm = dim*(dim-1)
+        self.mvars = mdl.variable(name+"_rqc", fu.Domain.inRotatedQCone(n_pmm, 3))
+        # Define a unique mapping for the minors
+        # NOTE: We assume the minors are indexed in according to the lower off diagonals
+        self.mmap = {}
+        ind = 0
+        for j in range(self.dim):
+            for i in range(j, self.dim):
+                if i == j:
+                    continue
+                else:
+                    self.mmap[(i,j)] = ind
+                    ind += 1
 
+        # Generate constraints for DD
+        self.generate_constraints()
+        
+    
+    def generate_constraints(self):
+        """Generate affine constraints that relate the minors to the """
+        for col in range(self.dim):
+            for row in range(col, self.dim):
+                if row == col:  # On diagonal, need to sum minors
+                    m_var_list = []
+                    for i in range(row-1): # Preceding minors
+                        m_ind = self.mmap[(row, i)]
+                        m_var_list.append(self.mvars.index(m_ind, 1))
+                    for i in range(row+1, self.dim): # Succeding minors
+                        m_ind = self.mmap[(i, row)]
+                        m_var_list.append(self.mvars.index(m_ind, 0))
+                    m_var = fu.Expr.add(m_var_list)
+                else: # Off diagonal, select corresponding minor
+                    m_ind = self.mmap[(row,col)]
+                    m_var = self.mvars.index(m_ind, 2) / np.sqrt(2)
+                # Define constraint
+                self.mdl.constraint(f"sdd_{row}_{col}", self.index(row, col) - m_var, fu.Domain.equalsTo(0.0))
+                
+    def level(self):
+        """Return level value in matrix form"""
+        values = self.vecvar.level()
+        mat = np.zeros(self.shape)
+        # Fill lower triangle
+        cols, rows = np.triu_indices(self.dim)
+        mat[rows, cols] = values
+        mat[range(self.dim),range(self.dim)] /= 2
+        
+        return mat + mat.T
+    
+    def index(self, i, j):
+            """Return the Mosek variable at the given index. Assume lower triangular"""
+            if i < j:
+                row, col = j, i
+            else:
+                row, col = i, j
+            ind = mat2vec_ind(self.dim, row, col)
+            
+            return self.vecvar.index(ind)
+
+        
 class ConsistencyGraphProb():
     def __init__(self, affinity, threshold=None):
         # Init affinity matrix
@@ -439,7 +508,7 @@ class ConsistencyGraphProb():
             elif cone == "DD":
                 H = DDConeVar(mdl=mdl, dim=n)
             elif cone == "SDD":
-                raise NotImplemented()
+                H = SDDConeVar(mdl=mdl, dim=n)
             else:
                 raise ValueError("cone input not recognized")
             # Define homogenization and trace constraint multipliers.
@@ -489,7 +558,7 @@ class ConsistencyGraphProb():
                 if cone == "SDP":
                     X = np.reshape(H.dual(), (n,n))
                     H = np.reshape(H.level(), (n,n))
-                elif cone == "DD":
+                elif cone in ["DD", "SDD"]:
                     X = None
                     H = H.level()
                 mults = [var.level() for var in variables]
