@@ -6,7 +6,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import unittest
 
-from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, mat2vec_ind
+from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, mat2vec_ind, PARAMS_SCS_DFLT
 
 class TestClipper(unittest.TestCase):
     def __init__(self, test_prob = "three-clique",seed=0):
@@ -97,27 +97,42 @@ class TestClipper(unittest.TestCase):
         self.assertIn("success", info)
         self.assertTrue(info["success"])
         self.check_solution(X,homog=False)
-        
+        # Get optimal solution and cost
+        cost = info['cost']
+        inliers, er, x_opt = self.prob.process_sdp_var(X)
+        x_opt_h = np.hstack([x_opt, 1.0])
+    
         # Check solution when homogenizing
         X_h, info_h = self.prob.solve_fusion(verbose=True,homog=True)
         self.assertIsNotNone(X_h)
         self.assertIn("success", info_h)
         self.assertTrue(info_h["success"])
-        self.check_solution(X_h,homog=True)
+        # Check that costs are the same
+        self.assertTrue(info['cost'] - info_h["cost"] < 1e-6)
+        # Check that optimal solution is in the null space of the certificate
+        np.testing.assert_allclose(info_h["H"]@x_opt_h, np.zeros(x_opt_h.shape), atol=1e-4)    
+        # Process to get low rank factor
+        V = self.prob.reduce_rank(X_h, info_h)
+        X_h_r = V @ V.T
+        self.check_solution(X_h_r,homog=True)
         
-        # Compare homogenized and non-homogenized solutions
-        
-        
-        
-    
-    def test_solve_fusion_v2(self):
-        X, info = self.prob.solve_fusion_v2(verbose=True)
+    def test_solve_fusion_dense(self):
+        X, info = self.prob.solve_fusion(verbose=True, dense_cost=True)
         self.assertIsNotNone(X)
         self.assertIn("success", info)
         self.assertTrue(info["success"])
-        
         self.check_solution(X)
-    
+        
+        # Check homogenized version
+        X_h, info_h = self.prob.solve_fusion(
+            verbose=True,
+            regularize=False,
+            dense_cost=True,
+            homog=True)
+        self.assertIsNotNone(X_h)
+        self.assertIn("success", info_h)
+        self.assertTrue(info_h["success"])
+        # self.check_solution(X)
     
     def test_scs_setup(self):
         cone, data = self.prob.get_scs_setup()
@@ -146,6 +161,18 @@ class TestClipper(unittest.TestCase):
         X, info = self.prob.solve_scs_sparse(verbose=True)
         self.check_solution(X)
         
+    def test_solve_scs_homog(self):
+        # Set up params
+        scs_params = PARAMS_SCS_DFLT
+        scs_params['verbose']=True
+        X, info = self.prob.solve_scs_sparse(setup_kwargs=scs_params, homog=True)
+        # Add constraint info
+        info['constraints'] = self.prob.get_affine_constraints_homog()
+        # # Process to get low rank factor
+        V = self.prob.reduce_rank(X, info)
+        X_h_r = V @ V.T
+        self.check_solution(X_h_r, homog=True)
+
     
     def test_symb_fact(self, plot=False):
         self.prob.symb_fact_affinity()
@@ -156,7 +183,7 @@ class TestClipper(unittest.TestCase):
             assert len(self.prob.cliques) == 2, ValueError("This test should only have two cliques")
             assert self.prob.cliques == [[0,1,2,3,4],[5,6,7]]
             mapping = {0:{0}, 1:{0},2:{0},3:{0},4:{0}, 5:{1}, 6:{1},7:{1}}
-            assert self.prob.ind_to_clq == mapping, ValueError("index to clique mapping incorrect")
+            assert self.prob.clq_lookup == mapping, ValueError("index to clique mapping incorrect")
         elif self.test_prob == "three-clique":
             assert len(self.prob.cliques) == 3, ValueError("This test should only have two cliques")
             cliques = [set([0,1,2,3,4]),set([4,5]),set([5,6,7])]
@@ -164,7 +191,7 @@ class TestClipper(unittest.TestCase):
                 assert set(clique) in cliques, ValueError("Cliques Incorrect")
                     
         # Test ind to clique map
-        for key, clq_list in self.prob.ind_to_clq.items():
+        for key, clq_list in self.prob.clq_lookup.items():
             for clq_ind in clq_list:
                 assert key in self.prob.cliques[clq_ind], ValueError("index to clique map is broken")        
         # Check that fill edges are not in original sparsity pattern
@@ -207,13 +234,14 @@ class TestClipper(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    test = TestClipper(test_prob="bunny")
+    test = TestClipper(test_prob="three-clique")
     # test.test_affine_constraints()
-    test.test_solve_fusion()
+    # test.test_solve_fusion()
+    # test.test_solve_fusion_dense()
     # test.test_symb_fact(plot=False)
     # test.test_solve_fusion()
     # test.test_solve_fusion_sparse()
     # test.test_scs_setup()
     # test.test_mat2vec_ind()
     # test.test_solve_scs()
-    # test.test_solve_fusion_v2()
+    test.test_solve_scs_homog()

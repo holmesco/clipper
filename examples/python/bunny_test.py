@@ -5,19 +5,10 @@ from scipy.spatial.transform import Rotation
 import networkx as nx
 import matplotlib.pyplot as plt
 from time import time
-from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points
+from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, PARAMS_SCS_DFLT
 from sksparse import cholmod
 import pandas as pd
 import seaborn as sns
-
-PARAMS_SCS_DFLT = dict(max_iters = 2000,
-                      acceleration_interval = 10,
-                      acceleration_lookback= 10,
-                      eps_abs = 1e-3,
-                      eps_rel = 1e-3,
-                      eps_infeas=1e-7,
-                      time_limit_secs=0,
-                      verbose = False)
 
 class BunnyProb():
     def __init__(self, m = 100, n1 = 100, n2o = 10, outrat = 0.9, sigma = 0.01, threshold=None, seed=0):

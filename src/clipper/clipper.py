@@ -15,6 +15,15 @@ import scs
 
 from src.clipper.rank_reduction import rank_reduction
 
+PARAMS_SCS_DFLT = dict(max_iters = 2000,
+                      acceleration_interval = 10,
+                      acceleration_lookback= 10,
+                      eps_abs = 1e-3,
+                      eps_rel = 1e-3,
+                      eps_infeas=1e-7,
+                      time_limit_secs=0,
+                      verbose = False)
+
 class ConsistencyGraphProb():
     def __init__(self, affinity, threshold=None):
         # Init affinity matrix
@@ -92,6 +101,41 @@ class ConsistencyGraphProb():
 
         return eqs, ineqs        
     
+    def get_affine_constraints_homog(self):
+        """Get the constraints corresponding to the SCS formulation below
+        NOTE: the ordering matters here; needs to align with lagrange multipliers"""
+         
+        # Generate positive constraint matrix
+        constraints = []
+        # Loop through variables.
+        for iVar in range(self.size):
+            rows = [iVar, self.size]
+            cols = [self.size, iVar]
+            vals = [1,1]
+            A = sp.csr_array((vals, (rows, cols)), shape = (self.size+1, self.size+1))
+            constraints.append(A)
+            
+        # Trace constraint
+        rows = list(range(self.size))
+        cols = list(range(self.size))
+        vals = np.ones(self.size)
+        A = sp.csr_array((vals, (rows, cols)), shape = (self.size+1, self.size+1))
+        constraints.append(A)
+        
+        # Homogenizing Constraint
+        A = sp.csr_array(([1], ([self.size],[self.size])), shape = (self.size+1, self.size+1))
+        constraints.append(A)
+             
+        # Fill in constraints
+        for i, j in self.fill_edges:
+            vals = [0.5, 0.5]
+            rows = [i, j]
+            cols = [j, i]
+            A = sp.csr_array((vals, (rows, cols)), shape = (self.size+1, self.size+1))
+            constraints.append(A)
+        return constraints
+    
+    
     @staticmethod
     def merge_cosmo(cp, ck, np, nk):
         """clique merge function from COSMO paper:
@@ -140,21 +184,21 @@ class ConsistencyGraphProb():
         # Get variable list in permuted order (symbolic factorization reorders things)
         var_list = list(range(self.size))
         var_list_perm = [var_list[p] for p in self.symb.p]
-        self.ind_to_clq=dict()
-        self.clique_dicts = []
+        self.clq_lookup=dict()
+        self.clq_var_lookups = []
         for iClq, clique in enumerate(self.cliques):
             # Get the cliques and separator sets in the original ordering
             self.cliques[iClq] = [var_list_perm[v] for v in clique]
             self.sepsets[iClq] = set([var_list_perm[v] for v in self.sepsets[iClq]])
             # Generate mapping from index to clique mapping as a dictionary of lists
             for ind in self.cliques[iClq]:
-                if ind not in self.ind_to_clq.keys():
-                    self.ind_to_clq[ind] = set([iClq])
+                if ind not in self.clq_lookup.keys():
+                    self.clq_lookup[ind] = set([iClq])
                 else:
-                    self.ind_to_clq[ind].add(iClq)
-            # Define clique dictionary for fast index lookup
-            clique_dict = {value : index for index, value in enumerate(self.cliques[iClq])}
-            self.clique_dicts.append(clique_dict)
+                    self.clq_lookup[ind].add(iClq)
+            # For each clique, define a lookup table that maps global index to clique index.
+            clq_var_lookup = {value : index for index, value in enumerate(self.cliques[iClq])}
+            self.clq_var_lookups.append(clq_var_lookup)
         # Get a list of "fill-in" edges
         pattern_filled = self.symb.sparsity_pattern(reordered=False)
         fillin = pattern_filled - self.pattern
@@ -416,9 +460,9 @@ class ConsistencyGraphProb():
     def get_scs_setup(self):
         """Generate the matrices and parameters to solve the sparse problem with SCS
         Constraints:
-        A^T y + c = [-I    A_p ] [y_p] +  0 == 0
-                    [0 -1  A_tr] [y_z] +  1 == 0
-                    [ 0    A_z ]       +  0 == 0
+        A^T y + c = [-I  A_p ] [y_p] +  0 == 0
+                    [ 0  A_tr] [y_z] +  1 == 0
+                    [ 0  A_z ]       +  0 == 0
         NOTE: We build At rather than A (using dual opt form)
         NOTE: We assume here that edges correspond to the lower triangle of the affinity matrix   
         """
@@ -434,7 +478,6 @@ class ConsistencyGraphProb():
         n_pos = len(self.edges)+1
         cone = dict(l=n_pos, s=clq_sizes)
         # Adjust starting indices
-        clq_start = clq_start
         n_clique_vars = ind
         n_vars = n_clique_vars + n_pos
         # Construct Ap and objective by looping through edges in assoc graph
@@ -508,6 +551,124 @@ class ConsistencyGraphProb():
         
         return cone, data
     
+    def get_scs_setup_homog(self):
+        """Generate the matrices and parameters to solve the sparse problem with SCS
+        In this case, we homogenize the problem to reduce the number of constraints.
+        Constraints:
+        A^T y + c = [-I    A_ineq ] [y_p  ] +  0 == 0
+                    [ 0    A_eq1  ] [y_sdp] +  1 == 0
+                    [ 0    A_eq2  ]         +  0 == 0
+        A_p : positivity constraints on the homogenized array: u_i * h >= 0
+        A_eq1: equality constraints for the trace constraint and the homogenization constraint
+        A_eq2 : constraints that set the fill-in edges to zero.
+        NOTE: We build At rather than A (using dual opt form)
+        NOTE: We assume here that edges correspond to the lower triangle of the affinity matrix   
+        """
+        # Generate clique information
+        clq_sizes = [] # Size of each clique variable
+        clq_start = [] # Starting indices of cliques
+        ind = 0
+        for clq in self.cliques:
+            clq_sizes.append(len(clq)+1)  # Add one more variable for homogenization
+            clq_start.append(ind)
+            ind += int(clq_sizes[-1]*(clq_sizes[-1]+1)/2)
+        # define cones
+        n_pos = self.size
+        cone = dict(l=n_pos, s=clq_sizes)
+        # Adjust starting indices
+        n_clique_vars = ind
+        n_vars = n_clique_vars + n_pos
+        # Construct Ap and objective by looping through edges in assoc graph
+        b = np.zeros(n_vars)
+        row_ind = 0
+        for edge in self.edges:
+            # Loop through cliques and add to sum
+            for iClq, row_c, col_c in self.get_clique_inds(edge):
+                # Off diagonal multiplier
+                if row_c == col_c:
+                    mult = 1
+                else:
+                    mult = np.sqrt(2)
+                # Get vectorized matrix index
+                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
+                # Add to objective
+                # NOTE: Objective could also be defined on the positive cone vars
+                b[vec_ind + clq_start[iClq]+n_pos] += -mult * self.affinity[edge]    
+              
+        # Generate positive constraint matrix
+        A_ineq_cols, A_ineq_rows, A_ineq_data = [], [], []
+        # Loop through variables. Add too positive constraint matrix
+        for iVar in range(self.size):
+            # Loop through cliques that "touch" this variable
+            clique_indices = self.clq_lookup[iVar]
+            for iClq in clique_indices:
+                # Get index of variable in clique
+                clq_var_ind = self.clq_var_lookups[iClq][iVar]
+                # Convert to vectorized index
+                vec_ind = mat2vec_ind(clq_sizes[iClq], clq_sizes[iClq]-1, clq_var_ind)
+                # Get column of A_ineq. Offset with clique starting index
+                col_ind = vec_ind + clq_start[iClq]
+                A_ineq_cols.append(col_ind)
+                A_ineq_rows.append(iVar)
+                A_ineq_data.append(mult)
+        # Build A_ineq matrix
+        A_ineq = sp.csc_array((A_ineq_data, (A_ineq_rows, A_ineq_cols)), shape=(n_pos,n_clique_vars))
+        
+        # Construct A_eq1
+        Aeq1_rows, Aeq1_cols, Aeq1_data = [], [], []
+        row_ind = 0
+        # Loop through cliques and add to sum
+        for iClq, size in enumerate(clq_sizes):
+            for i in range(size-1):
+                # TRACE CONSTRAINT
+                # Get vectorized matrix index
+                vec_ind = mat2vec_ind(size, i, i)
+                # Offset with clique starting index
+                Aeq1_cols.append(vec_ind + clq_start[iClq])
+                Aeq1_rows.append(0)
+                Aeq1_data.append(-1)
+            # HOMOGENIZING CONSTRAINT
+            # Get vectorized matrix index for last element
+            vec_ind = mat2vec_ind(size, size-1, size-1)
+            # Offset with clique starting index
+            Aeq1_cols.append(vec_ind + clq_start[iClq])
+            Aeq1_rows.append(1)
+            Aeq1_data.append(-1)
+        Aeq1 = sp.csc_array((Aeq1_data, (Aeq1_rows, Aeq1_cols)), shape=(2,n_clique_vars))
+        # Construct A_eq2
+        Aeq2_rows, Aeq2_cols, Aeq2_data = [], [], []
+        row_ind = 0
+        for edge in self.fill_edges:
+            # Loop through cliques and add to objective
+            for iClq, row_c, col_c in self.get_clique_inds(edge):
+                if row_c == col_c:
+                    mult = 1
+                else:
+                    mult = np.sqrt(2)
+                # Get vectorized matrix index
+                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
+                # Offset with clique starting index
+                Aeq2_cols.append(vec_ind + clq_start[iClq])
+                Aeq2_rows.append(row_ind)
+                Aeq2_data.append(mult)
+            # increment row of At
+            row_ind += 1
+        Aeq2 = sp.csc_array((Aeq2_data, (Aeq2_rows, Aeq2_cols)), shape=(row_ind, n_clique_vars))
+        # Build full matrix
+        I = sp.eye(n_pos, format='csc')
+        Aeq = sp.vstack([Aeq1, Aeq2])
+        Z = sp.csc_array((Aeq.shape[0], n_pos))
+        At_top = sp.hstack([-I, A_ineq])
+        At = sp.vstack([At_top, sp.hstack([Z, Aeq])])
+        # Create c array
+        c = np.zeros(n_pos + Aeq.shape[0])
+        c[n_pos] = 1
+        c[n_pos+1] = 1
+        # Build data dict
+        data = dict(A=At.T, b=b, c=c)
+        
+        return cone, data
+    
     def compute_warmstart(self, cone, data, warmstart = "max-density"):
         """Compute warm start for SCS."""
         
@@ -565,9 +726,7 @@ class ConsistencyGraphProb():
         return solver_kwargs
         
             
-            
-    
-    def solve_scs_sparse(self, setup_kwargs,warmstart=None):
+    def solve_scs_sparse(self, setup_kwargs, homog=False, warmstart=None):
         """
         Solve a sparse optimization problem using the SCS solver.
         This method sets up and solves a sparse version of the optimization problem 
@@ -586,7 +745,10 @@ class ConsistencyGraphProb():
         """ 
         # Set up problem
         t0 = time()
-        cone, data = self.get_scs_setup()
+        if homog:
+            cone, data = self.get_scs_setup_homog()
+        else:
+            cone, data = self.get_scs_setup()
         solver = scs.SCS(data, cone, **setup_kwargs)
         # Get initialization point 
         if warmstart is None:
@@ -599,13 +761,23 @@ class ConsistencyGraphProb():
         sol = solver.solve(**solve_kwargs)
         t2 = time()
         # Rebuild the solution
-        X = np.zeros(self.affinity.shape)
-        start_ind = cone['l']
+        if homog:
+            mat_shape = (self.size+1,self.size+1)
+        else:
+            mat_shape = (self.size,self.size)
+        X = np.zeros(mat_shape)
+        start_ind = cone['l'] # Skip over positive indices
         for clique_inds in self.cliques:
-            size = len(clique_inds)
+            inds = clique_inds
+            if homog:
+                size = len(clique_inds)+1
+                inds = clique_inds.copy()
+                inds.append(self.size)
+            else:
+                size = len(clique_inds)
             vec_size = int((size+1)*size/2)
             X_c = mat(sol['y'][start_ind: start_ind+vec_size])
-            X[np.ix_(clique_inds, clique_inds)] += X_c
+            X[np.ix_(inds, inds)] += X_c
             start_ind += vec_size
         # Store useful information
         info = dict(**sol)
@@ -613,21 +785,25 @@ class ConsistencyGraphProb():
         info['time_solve'] = t2 - t1
         # cache solution for warmstart
         self.stored_soln=dict(x=sol['x'], y=sol['y'], s=sol['s'])
-        
+        # Add information
+        info['mults'] = sol['x']
+        info['ineq'] = np.zeros(data['A'].shape[1])
+        info['ineq'][:cone['l']] = 1
+
         return X, info
         
         
     def get_clique_inds(self, edge):
         """Find all cliques that contain a given edge in the graph. Return tuple of variable indices in the form: (Clique index, row index, column index) """
         # Find the cliques that include the edge
-        clique0_inds = self.ind_to_clq[edge[0]]
-        clique1_inds = self.ind_to_clq[edge[1]]
+        clique0_inds = self.clq_lookup[edge[0]]
+        clique1_inds = self.clq_lookup[edge[1]]
         clique_inds = clique0_inds & clique1_inds
         # get vars across cliques
         var_list = []
         for clq_ind in clique_inds:
-            ind0 = self.clique_dicts[clq_ind][edge[0]]
-            ind1 = self.clique_dicts[clq_ind][edge[1]]
+            ind0 = self.clq_var_lookups[clq_ind][edge[0]]
+            ind1 = self.clq_var_lookups[clq_ind][edge[1]]
             # append to list, ensure that only lower triangle stored
             if ind0 >= ind1:
                 var_list.append((clq_ind,ind0, ind1))
@@ -642,7 +818,7 @@ class ConsistencyGraphProb():
         constraints, ineq, mults = info["constraints"],info["ineq"],info["mults"]
         binding_constraints = []
         for i in range(len(constraints)):
-            if not ineq[i] or (ineq[i] and np.abs(mults[i]) > tol):
+            if not ineq[i] or np.abs(mults[i]) > tol:
                 binding_constraints.append(constraints[i])
 
         V = rank_reduction(binding_constraints, X, null_tol = tol)
@@ -679,17 +855,41 @@ def vec(S):
 
 # The mat function as documented in api/cones
 def mat(s):
-    n = int((np.sqrt(8 * len(s) + 1) - 1) / 2)
-    S = np.zeros((n, n))
-    S[np.triu_indices(n)] = s / np.sqrt(2)
-    S = S + S.T
-    S[range(n), range(n)] /= np.sqrt(2)
+    """Convert matrix in half vectorized form into a symmetric matrix
+    Assume that the vector has more columns than rows.
+    """
+    if sp.issparse(s):
+        vecsize = max(s.shape)
+        matsize = int((np.sqrt(8 * vecsize + 1) - 1) / 2)
+        _, vec_inds = s.nonzero()
+        rows, cols, vals = [],[],[]
+        for vecind in vec_inds:
+            row, col = vech_index_to_lower_triangular(vecind, vecsize)
+            if row == col:
+                rows.append(row)
+                cols.append(col)
+                vals.append(s[vecind])
+            else:
+                rows.append([row, col])
+                cols.append([col, row])
+                val = s[vecind] / np.sqrt(2)
+                vals.append([val, val])
+        S = sp.csr_matrix((vals, (rows, cols)), (matsize, matsize))
+        
+    else:    
+        n = int((np.sqrt(8 * len(s) + 1) - 1) / 2)
+        S = np.zeros((n, n))
+        S[np.triu_indices(n)] = s / np.sqrt(2)
+        S = S + S.T
+        S[range(n), range(n)] /= np.sqrt(2)
     return S
 
 def mat2vec_ind(n, row, col):
+    """convert SDP matrix indices to index of the half vectorization"""
     assert row >= col, ValueError("Lower triangular indices are assumed")
     return int(n*col - (col-1)*col/2 + row - col )
-    
+
+
 def mat_fusion(X):
     """Convert sparse matrix X to fusion format"""
     try:

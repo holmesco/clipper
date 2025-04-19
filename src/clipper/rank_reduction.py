@@ -30,7 +30,7 @@ def rank_reduction(
     if verbose:
         print(f"Initial rank of solution: {r}")
     # Get constraint operator matrix
-    Av = get_constraint_op(Constraints, V)
+    vAv = get_constraint_op(Constraints, V)
 
     # REDUCE RANK
     n_iter = 0
@@ -38,7 +38,7 @@ def rank_reduction(
         targ_rank is None or r > targ_rank
     ):
         # Compute null space
-        vec, s_min = get_min_sing_vec(Av, method=null_method)
+        vec, s_min = get_min_sing_vec(vAv, method=null_method)
         if targ_rank is None and s_min > null_tol:
             if verbose:
                 print("Null space has no dimension. Exiting.")
@@ -58,7 +58,7 @@ def rank_reduction(
         # Get update matrix
         Q_tilde = Q[:, inds] * np.sqrt(lambdas_red[inds])
         # Update Nullspace matrix
-        Av = update_constraint_op(Av, Q_tilde, dim=r)
+        vAv = update_constraint_op(vAv, Q_tilde, dim=r)
         # Update Factor
         V = V @ Q_tilde
         r = V.shape[1]
@@ -112,16 +112,19 @@ def nullspace_projection(A, x, method="direct"):
 
 
 def get_min_sing_vec(A, method="svd"):
-    """Get vector associated with minimum singular value."""
+    """Get right singular vectors associated with minimum singular value."""
     if method == "svds":
         # Get minimum singular vector
         # NOTE: This method is fraught with numerical issues, but should be faster than computing all of the singular values
         s_min, vec = svds(A, k=1, which="SM")
 
     elif method == "svd":
-        # Get all singular vectors (descending order)
-        U, S, Vh = np.linalg.svd(A)
-        s_min = S[-1]
+        # Get all (right) singular vectors (descending order)
+        U, S, Vh = np.linalg.svd(A, full_matrices=True)
+        if len(S) < A.shape[1]:
+            s_min = 0
+        else:
+            s_min = S[-1]
         vec = Vh[-1, :]
     else:
         raise ValueError("Singular vector method unknown")
