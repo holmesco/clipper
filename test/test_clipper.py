@@ -10,15 +10,17 @@ from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, ge
 from src.clipper.rank_reduction import get_low_rank_factor
 
 class TestClipper(unittest.TestCase):
-    def __init__(self, test_prob = "three-clique",seed=0, threshold=0):
+    def __init__(self, test_prob = "three-clique",seed=0, outrat=0.9, threshold=0):
         self.test_prob = test_prob
         np.random.seed(seed)
         if test_prob == "bunny":
-            self.init_bunny_test()
+            self.init_bunny_test(outrat=outrat)
         elif test_prob == "two-clique":
             self.two_clique_test()
         elif test_prob == "three-clique":
             self.three_clique_test()
+        else:
+            raise ValueError("Problem not recognized.")
         
         # Define problem
         self.prob = ConsistencyGraphProb(self.affinity, threshold=threshold)
@@ -42,12 +44,12 @@ class TestClipper(unittest.TestCase):
         self.X = self.x @ self.x.T
 
 
-    def init_bunny_test(self):
+    def init_bunny_test(self, outrat):
         # Set up common variables for tests
         self.m = 100
         self.n1 = 100
         self.n2o = 10
-        self.outrat = 0.1
+        self.outrat = outrat
         self.sigma = 0.01
         self.pcfile = 'examples/data/bun10k.ply'
         self.T_21 = np.eye(4)
@@ -117,6 +119,15 @@ class TestClipper(unittest.TestCase):
         X_h_r = V @ V.T
         self.check_solution(X_h_r,homog=True)
         
+    def test_solve_fusion_homog_cost(self):
+        """Puts the cost """
+        X, info = self.prob.solve_fusion(verbose=True, homog=True, homog_cost=True)
+        self.assertIsNotNone(X)
+        self.assertIn("success", info)
+        self.assertTrue(info["success"])
+        self.check_solution(X, homog=True)
+        
+        
     def test_solve_fusion_dense(self):
         X, info = self.prob.solve_fusion(verbose=True, dense_cost=True)
         self.assertIsNotNone(X)
@@ -127,7 +138,7 @@ class TestClipper(unittest.TestCase):
         # Check homogenized version
         X_h, info_h = self.prob.solve_fusion(
             verbose=True,
-            regularize=False,
+            homog_cost=False,
             dense_cost=True,
             homog=True)
         self.assertIsNotNone(X_h)
@@ -220,7 +231,7 @@ class TestClipper(unittest.TestCase):
         self.assertTrue(info["success"])
         self.check_solution(X)
         
-    def test_fusion_dual_homog(self):
+    def test_fusion_dual_homog(self, tol = 1e-5):
         
         # SDP Cone
         H_sdp, info_sdp = self.prob.solve_fusion_dual_homog(verbose=True)
@@ -229,7 +240,14 @@ class TestClipper(unittest.TestCase):
         # SDD Cone
         H_sdd, info_sdd = self.prob.solve_fusion_dual_homog(verbose=True, cone="SDD")
         
-        print('done')
+        # Check that dual is corank 2
+        corank = np.sum(np.linalg.eigvalsh(H_sdp) < tol)
+        assert corank == 2, ValueError("SDP solution should have corank 2")
+        
+        # Check dual costs
+        assert info_sdd['cost'] - info_sdp['cost'] >= -tol, ValueError("SDD approximation should have higher cost than SDP")
+        assert info_dd['cost'] - info_sdd['cost'] >= -tol, ValueError("DD approximation should have higher cost than SDD")
+
         
         
     def check_solution(self, X, homog=False):
@@ -249,14 +267,15 @@ class TestClipper(unittest.TestCase):
             soln = self.clipper.get_solution()
             inliers_clipper = np.zeros(self.prob.size)
             inliers_clipper[soln.nodes] = 1
-            assert np.all(inliers == inliers_clipper), ValueError("Python SDP solution does not match CLIPPER SDR solution")
+            assert np.all(inliers == self.x.T), ValueError("Python SDP solution does not match CLIPPER SDR solution")
 
 
 if __name__ == "__main__":
-    test = TestClipper(test_prob="two-clique", threshold=0.5)
+    test = TestClipper(test_prob="bunny", outrat = 0.9, threshold=0.5)
     # test.test_affine_constraints()
     # test.test_solve_fusion()
     # test.test_solve_fusion_dense()
+    # test.test_solve_fusion_homog_cost()
     # test.test_symb_fact(plot=False)
     # test.test_solve_fusion()
     # test.test_solve_fusion_sparse()

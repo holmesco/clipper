@@ -5,10 +5,11 @@ from scipy.spatial.transform import Rotation
 import networkx as nx
 import matplotlib.pyplot as plt
 from time import time
-from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, PARAMS_SCS_DFLT
-from sksparse import cholmod
 import pandas as pd
 import seaborn as sns
+
+from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, PARAMS_SCS_DFLT
+from src.clipper.rank_reduction import get_low_rank_factor
 
 class BunnyProb():
     def __init__(self, m = 100, n1 = 100, n2o = 10, outrat = 0.9, sigma = 0.01, threshold=None, seed=0):
@@ -152,14 +153,18 @@ def run_fusion_v2(mult=2, verbose = False):
     
 
  
-def run_scs(prob, warmstart=None):
+def run_scs(prob, homog=False, warmstart=None):
     
     # Set up SCS options
     scs_params = PARAMS_SCS_DFLT
     scs_params['verbose']=True
     # Solve
-    X, info = prob.cgraph.solve_scs_sparse(setup_kwargs=scs_params, warmstart=warmstart)
+    X, info = prob.cgraph.solve_scs_sparse(setup_kwargs=scs_params, homog=homog, warmstart=warmstart)
     # Process solution
+    if homog:
+        V = get_low_rank_factor(X)
+        v = V[:,[0]] + V[:,[1]]
+        X = v @ v.T
     inliers, er, x_opt = prob.cgraph.process_sdp_var(X)
     precision, recall = prob.get_prec_recall(inliers)
     
@@ -218,12 +223,23 @@ def compare_sdps(mults = [2,3,4,5,6,7]):
     
 def compare_sdps_pp(filename='examples/results/sdp_comparison.pkl'):
     df = pd.read_pickle(filename)
-    df.loc[df['solver']=='scs-sparse','size'] = np.array([200, 300,400,500,600,700])
+    # df.loc[df['solver']=='scs-sparse','size'] = np.array([200, 300,400,500,600,700])
     
     f, ax = plt.subplots(figsize=(7, 7))
     ax.set(xscale="log", yscale="log")    
     sns.lineplot(data=df, ax=ax, hue='solver',x='size', y='t_total')
     plt.show()
+ 
+def test_scs_homog(mult = 1):
+    m = int(100*mult)
+    n1 = int(100*mult)
+    n2o = int(10*mult)
+    prob = BunnyProb(m=m, n1=n1, n2o=n2o)
+    
+    # run scs with homogenization
+    output=run_scs(prob, homog=True)
+    
+    
  
 if __name__ == "__main__":
     # run_scs(mult=5)
@@ -235,3 +251,6 @@ if __name__ == "__main__":
     # Comparison of SDP runtime
     # compare_sdps()
     compare_sdps_pp()
+    
+    # Homogenized version
+    # test_scs_homog(mult=2)

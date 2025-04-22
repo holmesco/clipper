@@ -18,8 +18,8 @@ from src.clipper.rank_reduction import rank_reduction
 PARAMS_SCS_DFLT = dict(max_iters = 2000,
                       acceleration_interval = 10,
                       acceleration_lookback= 10,
-                      eps_abs = 1e-5,
-                      eps_rel = 1e-5,
+                      eps_abs = 1e-3,
+                      eps_rel = 1e-3,
                       eps_infeas=1e-7,
                       time_limit_secs=0,
                       verbose = False)
@@ -116,7 +116,7 @@ class SDDConeVar():
             for row in range(col, self.dim):
                 if row == col:  # On diagonal, need to sum minors
                     m_var_list = []
-                    for i in range(row-1): # Preceding minors
+                    for i in range(row): # Preceding minors
                         m_ind = self.mmap[(row, i)]
                         m_var_list.append(self.mvars.index(m_ind, 1))
                     for i in range(row+1, self.dim): # Succeding minors
@@ -166,7 +166,7 @@ class ConsistencyGraphProb():
         self.symb_fact_affinity()
         
         # Mosek options
-        TOL = 1e-10
+        TOL = 1e-4
         self.options_cvxpy = {}
         self.options_cvxpy["mosek_params"] = {
             "MSK_IPAR_INTPNT_MAX_ITERATIONS": 500,
@@ -340,7 +340,7 @@ class ConsistencyGraphProb():
         self.filled_pattern.eliminate_zeros()
         
         
-    def solve_fusion(self, options=None, dense_cost = False, homog = False, threshold=0.0, regularize=False, verbose = False):
+    def solve_fusion(self, options=None, dense_cost = False, homog = False, threshold=0.0, homog_cost=False, verbose = False):
         """Solve the MSRC problem with Mosek Fusion"""
         if options is None:
             options = self.options_fusion
@@ -372,7 +372,7 @@ class ConsistencyGraphProb():
             M_d = -n*np.ones((n,n))
             M_d[rows,cols] = np.ones(len(rows))
             # Pad with zeros if homogenizing
-            if homog and regularize:
+            if homog and homog_cost:
                 M = np.block([[M_d,2*n*np.ones((n,1))], 
                             [2*n*np.ones((1,n)), np.zeros((1,1))]])
             elif homog:
@@ -380,11 +380,11 @@ class ConsistencyGraphProb():
                             [np.zeros((1,n)), np.zeros((1,1))]])
             else:
                 M = M_d
-        elif homog and regularize:              
-            # Add regularizer for linear terms (in homogenization)
-            rows += list(range(n)) +  n * [n]
-            cols += n * [n] + list(range(n))
-            vals += [1] * 2 * n
+        elif homog and homog_cost:              
+            # Put the cost on the homogenizing variables
+            rows = list(range(n)) +  n * [n]
+            cols = n * [n] + list(range(n))
+            vals = [1/2] * 2 * n
             M = fu.Matrix.sparse(size, size, rows, cols, vals )
         else: 
             M = fu.Matrix.sparse(size, size, rows, cols, vals )
@@ -704,11 +704,11 @@ class ConsistencyGraphProb():
                     mult = 1
                 else:
                     mult = np.sqrt(2)
+                # Get vectorized matrix index
+                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
                 # Add to objective
                 # NOTE: Objective could also be defined on the positive cone vars
                 b[vec_ind + clq_start[iClq]+n_pos] += -mult * self.affinity[edge]    
-                # Get vectorized matrix index
-                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
                 # Offset with clique starting index
                 Ap_cols.append(vec_ind + clq_start[iClq])
                 Ap_rows.append(row_ind)
