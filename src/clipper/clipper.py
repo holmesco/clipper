@@ -40,11 +40,11 @@ class DDConeVar():
         self.basis = self.get_basis_vectors(self.dim)
         # Define actual matrix
         basis_fu = mat_fusion(self.basis)
-        self.vecvar = basis_fu @ self.alpha
+        self.hvec = basis_fu @ self.alpha
 
     @staticmethod
     def get_basis_vectors(dim):
-        """Generate the DDCone Basis Vectors (half-vectorized format)"""
+        """Generate the DDCone Basis Vectors (scaled half-vectorized format)"""
         # Define basis vectors as columns of a sparse matrix
         rows, cols, vals = [], [], []
         currCol = 0
@@ -62,12 +62,12 @@ class DDConeVar():
                     ind_ij = mat2vec_ind(dim, j, i)
                     # positive off diag
                     rows += [ind_i, ind_j, ind_ij]
-                    vals += [1, 1, 1]
+                    vals += [1, 1, np.sqrt(2)]
                     cols += [currCol] * 3
                     currCol += 1  # increment column
                     # negative off diag
                     rows += [ind_i, ind_j, ind_ij]
-                    vals += [1, 1, -1]
+                    vals += [1, 1, -np.sqrt(2)]
                     cols += [currCol] * 3
                     currCol += 1  # increment column
         # Build matrix
@@ -77,23 +77,20 @@ class DDConeVar():
 
     def level(self):
         """Return level value in matrix form"""
-        values = self.basis @ self.alpha.level()
-        mat = np.zeros(self.shape)
-        # Fill lower triangle
-        cols, rows = np.triu_indices(self.dim)
-        mat[rows, cols] = values
-        mat[range(self.dim), range(self.dim)] /= 2
-
-        return mat + mat.T
+        return hvec2mat(self.basis @ self.alpha.level())
 
     def index(self, i, j):
         """Return the Mosek variable at the given index. Assume lower triangular"""
-        if i < j:
+        row, col = i, j
+        if i == j:
+            scale = 1
+        elif i < j:
             row, col = j, i
+            scale = 1/np.sqrt(2)
         else:
-            row, col = i, j
+            scale = 1/np.sqrt(2)
         ind = mat2vec_ind(self.dim, row, col)
-        return self.vecvar.index(ind)
+        return scale * self.hvec.index(ind)
 
 
 class SDDConeVar():
@@ -384,7 +381,7 @@ class ConsistencyGraphProb():
         self.filled_pattern = cvxmat2sparse(pattern_filled)
         self.filled_pattern.eliminate_zeros()
 
-    def solve_fusion(self, options=None, dense_cost=False, homog=False, threshold=0.0, homog_cost=False, verbose=False):
+    def solve_fusion(self, options=None, dense_cost=False,ineq=True, homog=False, threshold=0.0, homog_cost=False, verbose=False):
         """Solve the MSRC problem with Mosek Fusion"""
         if options is None:
             options = self.options_fusion
@@ -456,42 +453,41 @@ class ConsistencyGraphProb():
                         cols = [j, i]
                     A = fu.Matrix.sparse(size, size, rows, cols, vals)
                     # Each element of X is either zero or non-negative, depending on M
-                    # Equalities not required if dense cost is used
-                    if self.affinity[i, j] == 0 and not dense_cost:
-                        constr = mdl.constraint(
-                            fu.Expr.dot(A, X), fu.Domain.equalsTo(0))
-                        clist.append(constr)
-                        constraints.append(sp.csr_array(
-                            (vals, (rows, cols)), shape=(size, size)))
-                        ineq.append(False)
-                    elif not homog:
-                        # Enforce inequalities on variables if not homogenizing
-                        constr = mdl.constraint(fu.Expr.dot(
-                            A, X), fu.Domain.greaterThan(0))
+                    if self.affinity[i, j] == 0:
+                        # Equalities not required if dense cost is used
+                        if not dense_cost:
+                            constr = mdl.constraint(
+                                X.index(i,j)*2, fu.Domain.equalsTo(0))
+                            clist.append(constr)
+                            constraints.append(sp.csr_array(
+                                (vals, (rows, cols)), shape=(size, size)))
+                            ineq.append(False)
+                        if not homog and ineq:
+                            # Enforce inequalities on variables if not homogenizing
+                            constr = mdl.constraint(f"ineq_{i}_{j}", X.index(i,j)*2, fu.Domain.greaterThan(0))
+                            clist.append(constr)
+                            constraints.append(sp.csr_array(
+                                (vals, (rows, cols)), shape=(size, size)))
+                            ineq.append(True)
+
+            if homog:
+                if ineq:
+                    # Implement inequalities as homogenizing constraints.
+                    for i in range(n):
+                        rows = [i, n]
+                        cols = [n, i]
+                        vals = [0.5, 0.5]
+                        A = fu.Matrix.sparse(size, size, rows, cols, vals)
+                        constr = mdl.constraint(X.index(i,n)*2, fu.Domain.greaterThan(0))
                         clist.append(constr)
                         constraints.append(sp.csr_array(
                             (vals, (rows, cols)), shape=(size, size)))
                         ineq.append(True)
 
-            if homog:
-                # Implement inequalities as homogenizing constraints.
-                for i in range(n):
-                    rows = [i, n]
-                    cols = [n, i]
-                    vals = [0.5, 0.5]
-                    A = fu.Matrix.sparse(size, size, rows, cols, vals)
-                    constr = mdl.constraint(fu.Expr.dot(
-                        A, X), fu.Domain.greaterThan(0))
-                    clist.append(constr)
-                    constraints.append(sp.csr_array(
-                        (vals, (rows, cols)), shape=(size, size)))
-                    ineq.append(True)
-
                 # Add Homogenizing constraint
                 A_h = fu.Matrix.sparse(size, size, [n], [n], [1])
                 clist.append(constr)
-                constr = mdl.constraint(fu.Expr.dot(
-                    A_h, X), fu.Domain.equalsTo(1))
+                constr = mdl.constraint(X.index(n,n), fu.Domain.equalsTo(1))
                 constraints.append(sp.csr_array(
                     ([1], ([n], [n])), shape=(size, size)))
                 ineq.append(False)
@@ -506,11 +502,11 @@ class ConsistencyGraphProb():
                 (vals, (inds, inds)), shape=(size, size)))
             ineq.append(False)
             # Add affinity matrix objective
-            mdl.objective(fu.ObjectiveSense.Maximize, fu.Expr.dot(M, X))
+            mdl.objective(fu.ObjectiveSense.Minimize, fu.Expr.dot(M, -X))
 
             if verbose:
                 mdl.setLogHandler(sys.stdout)
-                # mdl.writeTask("problem.ptf")
+                mdl.writeTask("problem.ptf")
 
             for key, val in options.items():
                 mdl.setSolverParam(key, val)
@@ -571,11 +567,12 @@ class ConsistencyGraphProb():
             # Define inequality constraint multipliers
             mu = mdl.variable("mu", self.size, fu.Domain.greaterThan(0.0))
             lambda_ij = []
+            # NOTE: we only loop over half of the matrix
             for i in range(self.size):
                 # Add affinity matrix constraints
                 for j in range(i, self.size):
                     if i == j:
-                        # Diagonals always have trace constraint multiplier
+                        # Diagonals with trace constraint multiplier
                         value = lambda_t - self.affinity[i, i]
                     elif j > i:
                         # Off diagonals have multiplier only if affinity is zero
@@ -975,7 +972,7 @@ class ConsistencyGraphProb():
                 else:
                     X = np.zeros((len(clique), len(clique)))
                 # Add to list
-                y_sdp.append(vec(X))
+                y_sdp.append(mat2hvec(X))
             y_sdp = np.concatenate(y_sdp)
             # Compute the other cone vars from the constraints
             n_pos = cone['l']
@@ -1054,7 +1051,7 @@ class ConsistencyGraphProb():
             else:
                 size = len(clique_inds)
             vec_size = int((size+1)*size/2)
-            X_c = mat(sol['y'][start_ind: start_ind+vec_size])
+            X_c = hvec2mat(sol['y'][start_ind: start_ind+vec_size])
             X[np.ix_(inds, inds)] += X_c
             start_ind += vec_size
         # Store useful information
@@ -1094,7 +1091,7 @@ class ConsistencyGraphProb():
             else:
                 size = len(clique_inds)
             vec_size = int((size+1)*size/2)
-            H_c_list.append(mat(info['s'][start_ind: start_ind+vec_size]))
+            H_c_list.append(hvec2mat(info['s'][start_ind: start_ind+vec_size]))
             H[np.ix_(inds, inds)] = H_c_list[-1]
             start_ind += vec_size
 
@@ -1128,15 +1125,16 @@ class ConsistencyGraphProb():
         x : Relaxed PSD variable 
         s : Cone Variables
         y : Dual Cone Variables
-
+        NOTE: We only add cost and enforce constraints on the lower triangle of the PSD matrix
         """
+        # Size with homogenization
+        n_h = self.size + 1
         # Get number of zero constraints (non-edges)
-        n = self.size + 1
         n_edges = len(self.edges)
         n_not_edges = int(self.size*(self.size+1)/2) - n_edges
-        n_x = int(n*(n+1)/2)
+        n_x = int(n_h*(n_h+1)/2)
         # Get number of DD* cone constraints
-        n_dd = (n)**2
+        n_dd = (n_h)**2
         # Define problem cones
         # z : non-edge, trace, homogenizing constraints
         # l : DD* constraints, positivity constraits
@@ -1149,12 +1147,12 @@ class ConsistencyGraphProb():
         # Loop through matrix indices
         for i in range(self.size):
             # Keep track of trace indices and positive indices (homog vector)
-            tr_inds.append(mat2vec_ind(n, i, i))
-            pos_inds.append(mat2vec_ind(n, self.size, i))
+            tr_inds.append(mat2vec_ind(n_h, i, i))
+            pos_inds.append(mat2vec_ind(n_h, self.size, i))
             for j in range(i, self.size):
                 if self.affinity[i, j] == 0:
                     # Add constraint setting this element to zero
-                    vecind = mat2vec_ind(n, j, i)  # Get half vec index
+                    vecind = mat2vec_ind(n_h, j, i)  # Get half vec index
                     Aeq_rows.append(row_ind)
                     Aeq_cols.append(vecind)
                     Aeq_data.append(1.0)
@@ -1166,11 +1164,10 @@ class ConsistencyGraphProb():
                     if i == j:
                         c.append(-self.affinity[i, j])
                     else:
-                        c.append(-self.affinity[i, j]*2)
-
-            # Add final row to matrix
+                        c.append(-self.affinity[i, j] * np.sqrt(2))
+            # last row
             c.append(0)
-        # homogenizing cost element
+        # add homogenizing cost element and stack
         c.append(0)
         c = np.hstack(c)
         # Add trace constraint
@@ -1196,7 +1193,7 @@ class ConsistencyGraphProb():
         cols = pos_inds
         Apos = sp.csc_array((data, (rows, cols)), shape=(self.size, n_x))
         # Construct DD* constraints
-        Add = DDConeVar.get_basis_vectors(dim=n).T
+        Add = DDConeVar.get_basis_vectors(dim=n_h).T
         assert Add.shape == (n_dd, n_x), ValueError(
             "DD star cone constraints wrong size")
         # Construct full constraint matrix
@@ -1208,26 +1205,60 @@ class ConsistencyGraphProb():
 
         return cone, data
 
-    def solve_ddstar(self, max_iter=1, scs_params={}):
+    def solve_ddstar_cut(self, max_iter=1000, tol_eig=1e-5, num_cuts=15, scs_params={}):
         """
-
+        Solve the problem using the diagonally dominant program with optimality cuts.
+        This is the same as the column generation for outer approximation method defined in
+        "Optimization over Structured Subsets of Positive Semidefinite Matrices via Column Generation"
+        by Ahmadi et al.
         """
         # Get initial problem setup
         t0 = time()
-        cone, data = self.get_scs_setup_dd()
+        cone0, data0 = self.get_scs_setup_dd()
+        cone = cone0.copy()
+        data = data0.copy()
         t1 = time()
 
         # Tightening loop
         n_iter = 0
+        solve_init = {}  # For warmstarting, empty for first iter
         while n_iter < max_iter:
             # Set up and run solver
             solver = scs.SCS(data, cone, **scs_params)
-            sol = solver.solve()
+            sol = solver.solve(**solve_init)
             X = hvec2mat(sol['x'])
-            # Check eigenvalues
-            # TODO: Get min eigenvecs
-            # TODO: Add constraints/cuts
-
+            # Get eigenvalues of solution
+            vals, vecs = np.linalg.eigh(X)
+            # Find negative eigvals
+            inds = np.where(vals < -tol_eig)[0][0:num_cuts]
+            n_neg_eigs = len(inds)
+            if n_neg_eigs == 0:
+                # If no negative eigenvalues then break
+                break
+            else:
+                # Generate cuts corresponding to the negative eigs
+                cut_rows = []
+                for ind in inds:
+                    evec = vecs[:, [ind]]
+                    # Get new row of constraint matrix
+                    cut_rows.append(
+                        -mat2hvec(evec @ evec.T))
+                # Update Constraints
+                cone['l'] = cone['l'] + n_neg_eigs
+                A_cuts = np.vstack(cut_rows)
+                A_cuts_sp = sp.csc_array(A_cuts)
+                A_cuts_sp.eliminate_zeros()
+                data['A'] = sp.vstack([data['A'], A_cuts_sp])
+                data['b'] = np.hstack([data['b'], np.zeros(n_neg_eigs)])
+                # Set up warmstart for next round
+                solve_init = dict(warm_start=False,
+                                  x=sol['x'],
+                                  s=np.hstack(
+                                      [sol['s'], vals[inds]]),
+                                  y=np.hstack(
+                                      [sol['y'], np.ones(n_neg_eigs)]),
+                                  )
+            print(f"{n_iter}:  min eig: {vals[inds[:5]]}, opt val: {sol['info']['pobj']}")
             n_iter += 1
 
         # Retrieve dual solution
@@ -1283,24 +1314,10 @@ class ConsistencyGraphProb():
 
         return inliers, er, x_opt
 
-
-def hvec2mat(x):
-    assert len(x.shape) == 1, "Expected flattened input"
-    n = int((np.sqrt(8 * len(x) + 1) - 1) / 2)
-    # Retrieve solution
-    X = np.zeros((n, n))
-    # Fill lower triangle
-    cols, rows = np.triu_indices(n)
-    X[rows, cols] = x
-    # Halve diagonal
-    X[range(n), range(n)] /= 2
-    # Return symmetric mat
-    return X + X.T
-
-
 # The vec function as documented in api/cones
 
-def vec(S):
+
+def mat2hvec(S):
     n = S.shape[0]
     S = np.copy(S)
     S *= np.sqrt(2)
@@ -1309,7 +1326,7 @@ def vec(S):
 
 
 # The mat function as documented in api/cones
-def mat(s):
+def hvec2mat(s):
     """Convert matrix in half vectorized form into a symmetric matrix
     Assume that the vector has more columns than rows.
     """

@@ -98,7 +98,7 @@ class TestClipper(unittest.TestCase):
 
     def test_solve_fusion(self):
         # Check that solution is correct
-        X, info = self.prob.solve_fusion(verbose=True, homog=False)
+        X, info = self.prob.solve_fusion(verbose=True, ineq=False, homog=False)
         self.assertIsNotNone(X)
         self.assertIn("success", info)
         self.assertTrue(info["success"])
@@ -275,21 +275,36 @@ class TestClipper(unittest.TestCase):
         assert V.shape == (dim*(dim+1)/2, dim **
                            2), ValueError("Basis shape not correct")
         # Check diagonal dominance
-        vec = (V @ np.random.rand(dim**2)[:,None]).flatten()
-        mat = hvec2mat(vec)
+        hvec = (V @ np.random.rand(dim**2)[:, None]).flatten()
+        mat = hvec2mat(hvec)
         for i in range(dim):
-            thesum = np.sum(np.abs(mat[:,i])) - np.abs(mat[i,i])
-            assert mat[i,i] > thesum, ValueError("Matrix not diagonally dominant")
-            
-        print("test passed")
-        
-        
-    def test_ddstar(self):
-        scs_params = PARAMS_SCS_DFLT
-        scs_params['verbose'] = True
-        X, info = self.prob.solve_ddstar(scs_params={})
-        print("done")
+            thesum = np.sum(np.abs(mat[:, i])) - np.abs(mat[i, i])
+            assert mat[i, i] > thesum, ValueError(
+                "Matrix not diagonally dominant")
 
+        print("test passed")
+
+    def test_ddstar(self, tol=1e-3):
+        scs_params = PARAMS_SCS_DFLT
+        scs_params['verbose'] = False
+
+        # # Run for one iteration
+        # X, info_p = self.prob.solve_ddstar_cut(scs_params={}, max_iter=1)
+        # # Compare to dual solution
+        # H, info_d = self.prob.solve_fusion_dual_homog(
+        #     verbose=True, cone="DD")
+        # assert np.abs(-info_p['info']['pobj'] - info_d['cost']) < tol, ValueError(
+        #     "Primal and Dual versions of DD problem have different cost")
+        
+        # Run for multiple iterations
+        X, info_p = self.prob.solve_ddstar_cut(scs_params=scs_params)
+        # Compare to dual solution of SDP
+        H, info_d = self.prob.solve_fusion_dual_homog(
+            verbose=True, cone="SDP")
+        assert np.abs(-info_p['info']['pobj'] - info_d['cost']) < tol, ValueError(
+            "Primal and Dual versions of DD problem have different cost")
+        
+        
     def check_solution(self, X, homog=False):
         """Check that solution is rank 1 and that the solution matches what we expect."""
         # Process solution
@@ -314,7 +329,7 @@ class TestClipper(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    test = TestClipper(test_prob="three-clique", outrat=0.1, threshold=0.5)
+    test = TestClipper(test_prob="bunny", outrat=0.9, threshold=None)
     # test.test_affine_constraints()
     # test.test_solve_fusion()
     # test.test_solve_fusion_dense()
@@ -326,6 +341,6 @@ if __name__ == "__main__":
     # test.test_mat2vec_ind()
     # test.test_solve_scs()
     # test.test_solve_scs_homog()
-    test.test_fusion_dual_homog()
+    # test.test_fusion_dual_homog()
     # test.test_dd_basis()
-    # test.test_ddstar()
+    test.test_ddstar()
