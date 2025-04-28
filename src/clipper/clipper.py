@@ -12,6 +12,7 @@ from cvxopt import amd, spmatrix, matrix
 import chompack
 from time import time
 import scs
+import networkx as nx
 
 from src.clipper.rank_reduction import rank_reduction
 
@@ -28,23 +29,29 @@ PARAMS_SCS_DFLT = dict(max_iters=2000,
 class DDConeVar():
     """Implements diagonally dominant cone variable for mosek fusion"""
 
-    def __init__(self, mdl, dim, name="dd"):
+    def __init__(self, mdl, dim, U=None, name="dd"):
         assert isinstance(mdl, fu.Model), ValueError(
             "Must provide fusion model to define DDConVar")
         self.dim = dim  # Dimension of matrix
         self.shape = (dim, dim)
         self.mdl = mdl  # Model
+        # Change of basis matrix
+        self.U = U
         # Define basis variables
         self.alpha = mdl.variable(
             "alpha", self.dim**2, fu.Domain.greaterThan(0.0))
-        self.basis = self.get_basis_vectors(self.dim)
+        self.basis = self.get_basis_vectors(self.dim, U)
         # Define actual matrix
         basis_fu = mat_fusion(self.basis)
         self.hvec = basis_fu @ self.alpha
 
     @staticmethod
-    def get_basis_vectors(dim):
-        """Generate the DDCone Basis Vectors (scaled half-vectorized format)"""
+    def get_basis_vectors(dim, U=None):
+        """Generate the DDCone Basis Vectors (scaled half-vectorized format)
+        Args:
+            dim: the dimension of the DD matrix represented by the basis
+            U:   change of basis matrix to be applied to the DD matrix
+                    X = U.T Q U"""
         # Define basis vectors as columns of a sparse matrix
         rows, cols, vals = [], [], []
         currCol = 0
@@ -59,20 +66,32 @@ class DDConeVar():
                 elif j > i:
                     ind_i = mat2vec_ind(dim, i, i)
                     ind_j = mat2vec_ind(dim, j, j)
-                    ind_ij = mat2vec_ind(dim, j, i)
+                    ind_ij = mat2vec_ind(dim, i, j)
+                    ind_ji = mat2vec_ind(dim, j, i)
                     # positive off diag
-                    rows += [ind_i, ind_j, ind_ij]
-                    vals += [1, 1, np.sqrt(2)]
-                    cols += [currCol] * 3
+                    rows += [ind_i, ind_j, ind_ij, ind_ji]
+                    vals += [1, 1, 1, 1]
+                    cols += [currCol] * 4
                     currCol += 1  # increment column
                     # negative off diag
-                    rows += [ind_i, ind_j, ind_ij]
-                    vals += [1, 1, -np.sqrt(2)]
-                    cols += [currCol] * 3
+                    rows += [ind_i, ind_j, ind_ij, ind_ji]
+                    vals += [1, 1, -1, -1]
+                    cols += [currCol] * 4
                     currCol += 1  # increment column
         # Build matrix
-        shape = (int(dim*(dim+1)/2), dim**2)
+        shape = (dim**2, dim**2)
         basis = sp.csc_matrix((vals, (rows, cols)), shape=shape)
+        # Multiply by change of basis matrix if available
+        if U is not None:
+            if sp.issparse(U):
+                UkronU = sp.kron(U.T, U.T)
+            else:
+                UkronU = np.kron(U.T, U.T)
+            basis = UkronU @ basis
+        # Eliminate and rescale into half vectorization formulation
+        E = vec2hvec(dim)
+        basis = E @ basis
+
         return basis
 
     def level(self):
@@ -89,7 +108,7 @@ class DDConeVar():
             scale = 1/np.sqrt(2)
         else:
             scale = 1/np.sqrt(2)
-        ind = mat2vec_ind(self.dim, row, col)
+        ind = mat2hvec_ind(self.dim, row, col)
         return scale * self.hvec.index(ind)
 
 
@@ -180,24 +199,23 @@ class SDDConeVar():
             row, col = j, i
         else:
             row, col = i, j
-        ind = mat2vec_ind(self.dim, row, col)
+        ind = mat2hvec_ind(self.dim, row, col)
 
         return self.vecvar[ind]
 
 
 class ConsistencyGraphProb():
-    def __init__(self, affinity, threshold=None):
+    def __init__(self, affinity, factor=True):
         # Init affinity matrix
         if sp.issparse(affinity):
             self.affinity = affinity
         else:
             self.affinity = sp.csc_array(affinity)
-        if threshold is not None:
-            self.affinity = self.threshold_affinity(thresh=threshold)
-
+        
         self.size = self.affinity.shape[0]
         # Run Symbolic Factorization
-        self.symb_fact_affinity()
+        if factor:
+            self.symb_fact_affinity()
 
         # Mosek options
         TOL = 1e-4
@@ -318,7 +336,7 @@ class ConsistencyGraphProb():
         # Metric: Cp^3  + Ck^3 - (Cp + Nk)^3
         return cp**3 + ck**3 > (cp + nk) ** 3
 
-    def symb_fact_affinity(self, order=None, merge_func="cosmo"):
+    def symb_fact_affinity(self, order=None, merge_func=None):
         """Generates the symbolic factorization of the affinity matrix.
         This factorization generates a clique tree for the associated graph. 
         Key members: 
@@ -381,7 +399,7 @@ class ConsistencyGraphProb():
         self.filled_pattern = cvxmat2sparse(pattern_filled)
         self.filled_pattern.eliminate_zeros()
 
-    def solve_fusion(self, options=None, dense_cost=False,ineq=True, homog=False, threshold=0.0, homog_cost=False, verbose=False):
+    def solve_fusion(self, options=None, dense_cost=False, ineq=True, homog=False, threshold=0.0, homog_cost=False, verbose=False):
         """Solve the MSRC problem with Mosek Fusion"""
         if options is None:
             options = self.options_fusion
@@ -457,14 +475,15 @@ class ConsistencyGraphProb():
                         # Equalities not required if dense cost is used
                         if not dense_cost:
                             constr = mdl.constraint(
-                                X.index(i,j)*2, fu.Domain.equalsTo(0))
+                                X.index(i, j)*2, fu.Domain.equalsTo(0))
                             clist.append(constr)
                             constraints.append(sp.csr_array(
                                 (vals, (rows, cols)), shape=(size, size)))
                             ineq.append(False)
                         if not homog and ineq:
                             # Enforce inequalities on variables if not homogenizing
-                            constr = mdl.constraint(f"ineq_{i}_{j}", X.index(i,j)*2, fu.Domain.greaterThan(0))
+                            constr = mdl.constraint(f"ineq_{i}_{j}", X.index(
+                                i, j)*2, fu.Domain.greaterThan(0))
                             clist.append(constr)
                             constraints.append(sp.csr_array(
                                 (vals, (rows, cols)), shape=(size, size)))
@@ -478,7 +497,8 @@ class ConsistencyGraphProb():
                         cols = [n, i]
                         vals = [0.5, 0.5]
                         A = fu.Matrix.sparse(size, size, rows, cols, vals)
-                        constr = mdl.constraint(X.index(i,n)*2, fu.Domain.greaterThan(0))
+                        constr = mdl.constraint(
+                            X.index(i, n)*2, fu.Domain.greaterThan(0))
                         clist.append(constr)
                         constraints.append(sp.csr_array(
                             (vals, (rows, cols)), shape=(size, size)))
@@ -487,7 +507,7 @@ class ConsistencyGraphProb():
                 # Add Homogenizing constraint
                 A_h = fu.Matrix.sparse(size, size, [n], [n], [1])
                 clist.append(constr)
-                constr = mdl.constraint(X.index(n,n), fu.Domain.equalsTo(1))
+                constr = mdl.constraint(X.index(n, n), fu.Domain.equalsTo(1))
                 constraints.append(sp.csr_array(
                     ([1], ([n], [n])), shape=(size, size)))
                 ineq.append(False)
@@ -545,7 +565,7 @@ class ConsistencyGraphProb():
             }
             return X, info
 
-    def solve_fusion_dual_homog(self, options=None, cone='SDP', verbose=False):
+    def solve_fusion_dual_homog(self, options=None, cone='SDP', U=None, verbose=False):
         """Solve the homogenized dual problem using different cone approximations"""
         # Get options
         if options is None:
@@ -556,7 +576,7 @@ class ConsistencyGraphProb():
             if cone == "SDP":
                 H = mdl.variable("X", fu.Domain.inPSDCone(n))
             elif cone == "DD":
-                H = DDConeVar(mdl=mdl, dim=n)
+                H = DDConeVar(mdl=mdl, U=U, dim=n)
             elif cone == "SDD":
                 H = SDDConeVar(mdl=mdl, dim=n)
             else:
@@ -760,7 +780,7 @@ class ConsistencyGraphProb():
                 else:
                     mult = np.sqrt(2)
                 # Get vectorized matrix index
-                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
+                vec_ind = mat2hvec_ind(clq_sizes[iClq], row_c, col_c)
                 # Add to objective
                 # NOTE: Objective could also be defined on the positive cone vars
                 b[vec_ind + clq_start[iClq]+n_pos] += - \
@@ -781,7 +801,7 @@ class ConsistencyGraphProb():
         for iClq, size in enumerate(clq_sizes):
             for i in range(size):
                 # Get vectorized matrix index
-                vec_ind = mat2vec_ind(size, i, i)
+                vec_ind = mat2hvec_ind(size, i, i)
                 # Offset with clique starting index
                 Atr_cols.append(vec_ind + clq_start[iClq])
                 Atr_rows.append(0)
@@ -799,7 +819,7 @@ class ConsistencyGraphProb():
                 else:
                     mult = np.sqrt(2)
                 # Get vectorized matrix index
-                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
+                vec_ind = mat2hvec_ind(clq_sizes[iClq], row_c, col_c)
                 # Offset with clique starting index
                 Az_cols.append(vec_ind + clq_start[iClq])
                 Az_rows.append(row_ind)
@@ -862,7 +882,7 @@ class ConsistencyGraphProb():
                 else:
                     mult = np.sqrt(2)
                 # Get vectorized matrix index
-                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
+                vec_ind = mat2hvec_ind(clq_sizes[iClq], row_c, col_c)
                 # Add to objective
                 # NOTE: Objective could also be defined on the positive cone vars
                 b[vec_ind + clq_start[iClq]+n_pos] += - \
@@ -878,7 +898,7 @@ class ConsistencyGraphProb():
                 # Get index of variable in clique
                 clq_var_ind = self.clq_var_lookups[iClq][iVar]
                 # Convert to vectorized index
-                vec_ind = mat2vec_ind(
+                vec_ind = mat2hvec_ind(
                     clq_sizes[iClq], clq_sizes[iClq]-1, clq_var_ind)
                 # Get column of A_ineq. Offset with clique starting index
                 col_ind = vec_ind + clq_start[iClq]
@@ -897,14 +917,14 @@ class ConsistencyGraphProb():
             for i in range(size-1):
                 # TRACE CONSTRAINT
                 # Get vectorized matrix index
-                vec_ind = mat2vec_ind(size, i, i)
+                vec_ind = mat2hvec_ind(size, i, i)
                 # Offset with clique starting index
                 Aeq1_cols.append(vec_ind + clq_start[iClq])
                 Aeq1_rows.append(0)
                 Aeq1_data.append(-1)
             # HOMOGENIZING CONSTRAINT
             # Get vectorized matrix index for last element
-            vec_ind = mat2vec_ind(size, size-1, size-1)
+            vec_ind = mat2hvec_ind(size, size-1, size-1)
             # Offset with clique starting index
             Aeq1_cols.append(vec_ind + clq_start[iClq])
             Aeq1_rows.append(1)
@@ -922,7 +942,7 @@ class ConsistencyGraphProb():
                 else:
                     mult = np.sqrt(2)
                 # Get vectorized matrix index
-                vec_ind = mat2vec_ind(clq_sizes[iClq], row_c, col_c)
+                vec_ind = mat2hvec_ind(clq_sizes[iClq], row_c, col_c)
                 # Offset with clique starting index
                 Aeq2_cols.append(vec_ind + clq_start[iClq])
                 Aeq2_rows.append(row_ind)
@@ -1147,12 +1167,12 @@ class ConsistencyGraphProb():
         # Loop through matrix indices
         for i in range(self.size):
             # Keep track of trace indices and positive indices (homog vector)
-            tr_inds.append(mat2vec_ind(n_h, i, i))
-            pos_inds.append(mat2vec_ind(n_h, self.size, i))
+            tr_inds.append(mat2hvec_ind(n_h, i, i))
+            pos_inds.append(mat2hvec_ind(n_h, self.size, i))
             for j in range(i, self.size):
                 if self.affinity[i, j] == 0:
                     # Add constraint setting this element to zero
-                    vecind = mat2vec_ind(n_h, j, i)  # Get half vec index
+                    vecind = mat2hvec_ind(n_h, j, i)  # Get half vec index
                     Aeq_rows.append(row_ind)
                     Aeq_cols.append(vecind)
                     Aeq_data.append(1.0)
@@ -1258,7 +1278,8 @@ class ConsistencyGraphProb():
                                   y=np.hstack(
                                       [sol['y'], np.ones(n_neg_eigs)]),
                                   )
-            print(f"{n_iter}:  min eig: {vals[inds[:5]]}, opt val: {sol['info']['pobj']}")
+            print(
+                f"{n_iter}:  min eig: {vals[inds[:5]]}, opt val: {sol['info']['pobj']}")
             n_iter += 1
 
         # Retrieve dual solution
@@ -1329,6 +1350,7 @@ def mat2hvec(S):
 def hvec2mat(s):
     """Convert matrix in half vectorized form into a symmetric matrix
     Assume that the vector has more columns than rows.
+    Column major ordering assumed.
     """
     n = int((np.sqrt(8 * len(s) + 1) - 1) / 2)
     S = np.zeros((n, n))
@@ -1338,10 +1360,34 @@ def hvec2mat(s):
     return S
 
 
-def mat2vec_ind(n, row, col):
-    """convert SDP matrix indices to index of the half vectorization"""
+def vec2hvec(n):
+    """convert full vec to scaled half vec"""
+    rows, cols, vals = [], [], []
+    col_ind = 0
+    for j in range(n):  # Column Loop
+        for i in range(n):  # Row Loop
+            if i == j:
+                rows.append(mat2hvec_ind(n, i, j))
+                cols.append(col_ind)
+                vals.append(1.0)
+            elif i > j:
+                rows.append(mat2hvec_ind(n, i, j))
+                cols.append(col_ind)
+                vals.append(np.sqrt(2))
+            col_ind += 1
+    return sp.csc_array((vals, (rows, cols)), shape=(int(n*(n+1)/2), n*n))
+
+
+def mat2hvec_ind(n, row, col):
+    """convert SDP matrix indices to index of the half vectorization
+    Column major ordering assumed"""
     assert row >= col, ValueError("Lower triangular indices are assumed")
     return int(n*col - (col-1)*col/2 + row - col)
+
+
+def mat2vec_ind(n, row, col):
+    """Convert matrix indices to vectorized index. Column major ordering assumed"""
+    return n*col+row
 
 
 def mat_fusion(X):
@@ -1477,7 +1523,7 @@ def draw_registration_result(source, target, transformation):
     o3d.visualization.draw_geometries([source_temp, target_temp])
 
 
-def get_affinity_from_points(points_1, points_2, associations):
+def get_affinity_from_points(points_1, points_2, associations, threshold=0.5):
     # Define invariant function
     iparams = clipperpy.invariants.EuclideanDistanceParams()
     iparams.sigma = 0.01
@@ -1488,10 +1534,39 @@ def get_affinity_from_points(points_1, points_2, associations):
     params.rounding = clipperpy.Rounding.DSD_HEU
     # define clipper object
     clipper = clipperpy.CLIPPER(invariant, params)
+    
     # Get pairwise consistency matrix
     clipper.score_pairwise_consistency(points_1, points_2, associations)
     # Get affinity
     M = clipper.get_affinity_matrix()
+    # HACK Manual threshold
+    if threshold > 0.0:
+        M = (M > threshold).astype(float)
+        # Set constraint and affinity matrix to thresholded values.
+        clipper.set_matrix_data(M=M, C=M)
+    # Convert to sparse
     M = sp.csr_array(M)
-    M.eliminate_zeros()
+    M.eliminate_zeros()    
+    
     return M, clipper
+
+
+def prune_affinity(affinity, clique_size_lb):
+    """Prune the graph based on the fact that nodes with degree lower than the max clique size can be safely removed.
+    NOTE: It is assumed that the affinity matrix is binary (i.e., thresholded)
+    """
+    # Get number of nodes
+    n = affinity.shape[0]
+    # Get edges
+    edges = list(zip(*affinity.nonzero()))
+    edges = [edge for edge in edges if edge[1] > edge[0]]
+    # Define graph structure
+    G = nx.Graph()
+    G.add_nodes_from(list(range(n)))
+    G.add_edges_from(edges)
+    # Get k-core
+    G_pruned = nx.k_core(G, k=clique_size_lb-1)
+    keep_inds =list(G_pruned.nodes)
+    
+    return affinity[keep_inds][:, keep_inds]
+    

@@ -6,16 +6,16 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import unittest
 
-from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, mat2vec_ind, PARAMS_SCS_DFLT, DDConeVar, hvec2mat
+from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, mat2hvec_ind, PARAMS_SCS_DFLT, DDConeVar, hvec2mat, prune_affinity
 from src.clipper.rank_reduction import get_low_rank_factor
 
 
 class TestClipper(unittest.TestCase):
-    def __init__(self, test_prob="three-clique", seed=0, outrat=0.9, threshold=0):
+    def __init__(self, test_prob="three-clique", seed=0, outrat=0.9, threshold=0.0):
         self.test_prob = test_prob
         np.random.seed(seed)
         if test_prob == "bunny":
-            self.init_bunny_test(outrat=outrat)
+            self.init_bunny_test(outrat=outrat, threshold=threshold)
         elif test_prob == "two-clique":
             self.two_clique_test()
         elif test_prob == "three-clique":
@@ -24,7 +24,7 @@ class TestClipper(unittest.TestCase):
             raise ValueError("Problem not recognized.")
 
         # Define problem
-        self.prob = ConsistencyGraphProb(self.affinity, threshold=threshold)
+        self.prob = ConsistencyGraphProb(self.affinity)
         self.size = self.affinity.shape[0]
 
     def two_clique_test(self):
@@ -44,7 +44,7 @@ class TestClipper(unittest.TestCase):
         self.x = np.vstack([np.ones((5, 1)), np.zeros((3, 1))])
         self.X = self.x @ self.x.T
 
-    def init_bunny_test(self, outrat):
+    def init_bunny_test(self, outrat, threshold=0.0):
         # Set up common variables for tests
         self.m = 100
         self.n1 = 100
@@ -61,7 +61,7 @@ class TestClipper(unittest.TestCase):
         )
         # Generate affinity
         self.affinity, self.clipper = get_affinity_from_points(
-            self.D1, self.D2, self.A)
+            self.D1, self.D2, self.A, threshold=threshold)
         # Generate a solution vector
         x = np.zeros((self.A.shape[0], 1))
         for i, a in enumerate(self.A):
@@ -174,7 +174,7 @@ class TestClipper(unittest.TestCase):
     def test_mat2vec_ind(self, n=10):
         cols, rows = np.triu_indices(n)
         inds = list(zip(rows, cols))
-        vec_inds = [mat2vec_ind(n, row, col) for row, col in inds]
+        vec_inds = [mat2hvec_ind(n, row, col) for row, col in inds]
         assert np.all(vec_inds == list(range(len(vec_inds)))), ValueError(
             "Vectorization indexing not working")
 
@@ -268,9 +268,27 @@ class TestClipper(unittest.TestCase):
             tol, ValueError(
                 "DD approximation should have higher cost than SDD")
 
+    def test_dd_change_basis(self, tol=1e-5):
+        """test diagonal dominant with change of basis"""
+
+        # SDP Cone
+        # H_sdp, info_sdp = self.prob.solve_fusion_dual_homog(verbose=True)
+        # DD Cone
+        H_dd, info_dd = self.prob.solve_fusion_dual_homog(
+            verbose=True, cone="DD")
+
+        for i in range(5):
+            U = np.linalg.cholesky(H_dd+np.eye(H_dd.shape[0])*1e-6)
+            U = sp.sparse.csc_array(U)
+            U.eliminate_zeros()
+            H_dd, info_dd = self.prob.solve_fusion_dual_homog(
+                verbose=True, cone="DD", U=U.T)
+
+        print("done")
+
     def test_dd_basis(self):
         """Test the DD basis vector generation"""
-        dim = 500
+        dim = 50
         V = DDConeVar.get_basis_vectors(dim=dim)
         assert V.shape == (dim*(dim+1)/2, dim **
                            2), ValueError("Basis shape not correct")
@@ -282,7 +300,56 @@ class TestClipper(unittest.TestCase):
             assert mat[i, i] > thesum, ValueError(
                 "Matrix not diagonally dominant")
 
-        print("test passed")
+        # Check version with change of basis
+        U = np.random.randn(dim, dim) * 5
+        V = DDConeVar.get_basis_vectors(dim=dim, U=U)
+        assert V.shape == (dim*(dim+1)/2, dim **
+                           2), ValueError("Basis shape not correct")
+        # Check diagonal dominance
+        hvec = (V @ np.random.rand(dim**2)[:, None]).flatten()
+        Uinv = np.linalg.inv(U)
+        mat = Uinv.T @ hvec2mat(hvec) @ Uinv
+
+        for i in range(dim):
+            thesum = np.sum(np.abs(mat[:, i])) - np.abs(mat[i, i])
+            assert mat[i, i] > thesum, ValueError(
+                "Matrix not diagonally dominant")
+
+    def test_pruning(self):
+        # Generate graph
+        n = 9
+        edges = np.array([[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3], [
+                         3, 4], [4, 5], [4, 6], [4, 7], [4, 8], [1, 8]])
+        affinity = sp.sparse.csc_array(
+            (np.ones(len(edges)), (edges[:, 0], edges[:, 1])), shape=(n, n))
+        affinity = affinity + affinity.T
+        affinity = affinity + sp.sparse.eye(n)
+        # Get pruned affinity matrix
+        new_affinity = prune_affinity(affinity=affinity, clique_size_lb=3)
+        assert new_affinity.shape == (6, 6), ValueError(
+            "Returned wrong affinity matrix")
+        new_affinity = prune_affinity(affinity=affinity, clique_size_lb=4)
+        assert new_affinity.shape == (4, 4), ValueError(
+            "Returned wrong affinity matrix")
+        assert np.all(new_affinity.toarray() == 1), ValueError(
+            "Returned wrong affinity matrix")
+
+        # NOTE: We assume the matrix is thresholded
+        # Solve the problem to get max clique approx
+        self.clipper.solve()
+        soln = self.clipper.get_solution()
+        max_clq_sz = len(soln.nodes)
+        # Prune
+        affinity = self.prob.affinity
+        affinity_new = prune_affinity(affinity, max_clq_sz)
+        # Get degree+1
+        degree = np.sum(affinity_new, axis=0)
+        # Check shapes
+        assert affinity_new.shape[0] > 0, ValueError(
+            "Pruned affinity is empty")
+        assert np.all(degree - \
+            max_clq_sz >= 0), ValueError(
+                "Minimum degree should be greater than (max clique size)-1")
 
     def test_ddstar(self, tol=1e-3):
         scs_params = PARAMS_SCS_DFLT
@@ -295,7 +362,7 @@ class TestClipper(unittest.TestCase):
         #     verbose=True, cone="DD")
         # assert np.abs(-info_p['info']['pobj'] - info_d['cost']) < tol, ValueError(
         #     "Primal and Dual versions of DD problem have different cost")
-        
+
         # Run for multiple iterations
         X, info_p = self.prob.solve_ddstar_cut(scs_params=scs_params)
         # Compare to dual solution of SDP
@@ -303,8 +370,7 @@ class TestClipper(unittest.TestCase):
             verbose=True, cone="SDP")
         assert np.abs(-info_p['info']['pobj'] - info_d['cost']) < tol, ValueError(
             "Primal and Dual versions of DD problem have different cost")
-        
-        
+
     def check_solution(self, X, homog=False):
         """Check that solution is rank 1 and that the solution matches what we expect."""
         # Process solution
@@ -329,7 +395,7 @@ class TestClipper(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    test = TestClipper(test_prob="bunny", outrat=0.9, threshold=None)
+    test = TestClipper(test_prob="bunny", outrat=0.9, threshold=0.8)
     # test.test_affine_constraints()
     # test.test_solve_fusion()
     # test.test_solve_fusion_dense()
@@ -342,5 +408,7 @@ if __name__ == "__main__":
     # test.test_solve_scs()
     # test.test_solve_scs_homog()
     # test.test_fusion_dual_homog()
+    # test.test_dd_change_basis()
     # test.test_dd_basis()
-    test.test_ddstar()
+    # test.test_ddstar()
+    test.test_pruning()
