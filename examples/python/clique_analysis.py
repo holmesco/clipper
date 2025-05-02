@@ -107,7 +107,7 @@ def run_prune_analysis():
     data = []
     clq_size_data = []
     for outrate in outrates:
-        affinity, clipper = get_affinity(outrate, mult=2, threshold=0.5)
+        affinity, clipper = get_affinity(outrate, mult=5, threshold=0.5)
         for pruned in [False, True]:
             if pruned:
                 # run clipper to get lower bound on max clique size
@@ -115,15 +115,18 @@ def run_prune_analysis():
                 soln = clipper.get_solution()
                 max_clq_sz = len(soln.nodes)
                 # prune the matrix
-                affinity_pr = prune_affinity(affinity, max_clq_sz)
+                affinity_pr, _ = prune_affinity(affinity, max_clq_sz)
             else:
                 affinity_pr = affinity
+                max_clq_sz = 0
 
             # Create graph problems to run symbolic factorization
             prob = ConsistencyGraphProb(affinity=affinity_pr)
             # Get clique sizes
             clq_sizes = [len(c) for c in prob.cliques]
             num_vars_p = np.sum([n*(n+1)/2 for n in clq_sizes])
+            # Get the number of constraints in the original problem.
+            num_cons = (affinity_pr.shape[0]**2 - affinity_pr.nnz)/2 + 1
 
             data.append(dict(n1=affinity.shape[0],
                              n2=affinity_pr.shape[0],
@@ -132,8 +135,10 @@ def run_prune_analysis():
                              min_clq=np.min(clq_sizes),
                              num_clqs=len(clq_sizes),
                              num_vars_p=num_vars_p,
+                             num_cons=num_cons,
                              pruned=pruned,
                              outrate=outrate,
+                             soln_clq_sz=max_clq_sz,
                              )
                         )
             for sz in clq_sizes:
@@ -147,7 +152,7 @@ def run_prune_analysis():
     df.to_csv(f"examples/results/pruning_analysis_raw.csv")
 
 
-def prune_analysis_pp(filename="examples/results/pruning_analysis.csv", rawfile="examples/results/pruning_analysis_raw.csv"):
+def prune_analysis_pp(filename="examples/results/pruning_analysis_summary.csv", rawfile="examples/results/pruning_analysis_raw.csv"):
     """Generate plots for pruning analysis"""
     df = pd.read_csv(filename)
 
@@ -159,15 +164,19 @@ def prune_analysis_pp(filename="examples/results/pruning_analysis.csv", rawfile=
     sns.lineplot(df, x="outrate", y="max_clq",
                  hue="pruned", markers=True, ax=axs[1])
     axs[1].set_xlabel('outlier rate')
-    axs[1].set_ylabel('max clique')
-    sns.lineplot(df, x="outrate", y="mean_clq",
+    axs[1].set_ylabel('max SDP var')
+    # sns.lineplot(df, x="outrate", y="mean_clq",
+    #              hue="pruned", markers=True, ax=axs[2])
+    # axs[2].set_xlabel('outlier rate')
+    # axs[2].set_ylabel('avg clique size')
+    sns.lineplot(df, x="outrate", y="n2",
                  hue="pruned", markers=True, ax=axs[2])
     axs[2].set_xlabel('outlier rate')
-    axs[2].set_ylabel('avg clique size')
-    sns.lineplot(df, x="outrate", y="num_vars_p",
+    axs[2].set_ylabel('problem size')
+    sns.lineplot(df, x="outrate", y="num_cons",
                  hue="pruned", markers=True, ax=axs[3])
     axs[3].set_xlabel('outlier rate')
-    axs[3].set_ylabel('Total SDP Variables')
+    axs[3].set_ylabel('num constraints')
     axs[3].set_yscale('log')
 
     # # Make violin plots
@@ -208,5 +217,5 @@ if __name__ == "__main__":
     # run_analysis_pp()
 
     # Analysis on the effect of pruning
-    # run_prune_analysis()
+    run_prune_analysis()
     prune_analysis_pp()

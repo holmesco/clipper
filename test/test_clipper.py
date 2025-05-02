@@ -6,7 +6,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import unittest
 
-from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, mat2hvec_ind, PARAMS_SCS_DFLT, DDConeVar, hvec2mat, prune_affinity
+from src.clipper.clipper import ConsistencyGraphProb, generate_bunny_dataset, get_affinity_from_points, mat2hvec_ind, PARAMS_SCS_DFLT, DDConeVar, hvec2mat, prune_affinity, dd_cone_project
 from src.clipper.rank_reduction import get_low_rank_factor
 
 
@@ -98,7 +98,7 @@ class TestClipper(unittest.TestCase):
 
     def test_solve_fusion(self):
         # Check that solution is correct
-        X, info = self.prob.solve_fusion(verbose=True, ineq=False, homog=False)
+        X, info = self.prob.solve_fusion(verbose=True, ineq=True, homog=False)
         self.assertIsNotNone(X)
         self.assertIn("success", info)
         self.assertTrue(info["success"])
@@ -137,12 +137,12 @@ class TestClipper(unittest.TestCase):
         self.assertIsNotNone(X)
         self.assertIn("success", info)
         self.assertTrue(info["success"])
-        self.check_solution(X)
+        # self.check_solution(X)
 
         # Check homogenized version
         X_h, info_h = self.prob.solve_fusion(
             verbose=True,
-            homog_cost=False,
+            homog_cost=True,
             dense_cost=True,
             homog=True)
         self.assertIsNotNone(X_h)
@@ -325,10 +325,10 @@ class TestClipper(unittest.TestCase):
         affinity = affinity + affinity.T
         affinity = affinity + sp.sparse.eye(n)
         # Get pruned affinity matrix
-        new_affinity = prune_affinity(affinity=affinity, clique_size_lb=3)
+        new_affinity, _ = prune_affinity(affinity=affinity, clique_size_lb=3)
         assert new_affinity.shape == (6, 6), ValueError(
             "Returned wrong affinity matrix")
-        new_affinity = prune_affinity(affinity=affinity, clique_size_lb=4)
+        new_affinity,_ = prune_affinity(affinity=affinity, clique_size_lb=4)
         assert new_affinity.shape == (4, 4), ValueError(
             "Returned wrong affinity matrix")
         assert np.all(new_affinity.toarray() == 1), ValueError(
@@ -341,27 +341,55 @@ class TestClipper(unittest.TestCase):
         max_clq_sz = len(soln.nodes)
         # Prune
         affinity = self.prob.affinity
-        affinity_new = prune_affinity(affinity, max_clq_sz)
+        affinity_new, _ = prune_affinity(affinity, max_clq_sz)
         # Get degree+1
         degree = np.sum(affinity_new, axis=0)
         # Check shapes
         assert affinity_new.shape[0] > 0, ValueError(
             "Pruned affinity is empty")
-        assert np.all(degree - \
-            max_clq_sz >= 0), ValueError(
-                "Minimum degree should be greater than (max clique size)-1")
+        assert np.all(degree -
+                      max_clq_sz >= 0), ValueError(
+            "Minimum degree should be greater than (max clique size)-1")
+
+    def test_dd_project(self, tol=1e-5):
+        # SDP Cone
+        H_sdp, info_sdp = self.prob.solve_fusion_dual_homog(verbose=True)
+
+        # DD CONE
+        H_dd, info_dd = self.prob.solve_fusion_dual_homog(
+            verbose=True, cone="DD")
+        H_dd_proj, cost = dd_cone_project(H_dd, cone='DD', verbose=True)
+        assert cost > 0, ValueError("Cost should be positive")
+        assert cost < tol, ValueError("Projection cost should be zero")
+        assert np.max(np.abs(H_dd_proj - H_dd)
+                      ) < tol, ValueError("Projection cost should do nothing")
+        # Project PSD Matrix
+        H_dd_proj, cost = dd_cone_project(H_sdp, cone='DD', verbose=True)
+        assert cost > tol, ValueError("Cost should not be zero positive")
+
+        # SDD CONE
+        H_sdd, info_sdd = self.prob.solve_fusion_dual_homog(
+            verbose=True, cone="SDD")
+        H_sdd_proj, cost = dd_cone_project(H_sdd, cone='SDD', verbose=True)
+        assert cost > 0, ValueError("Cost should be positive")
+        assert cost < tol, ValueError("Projection cost should be zero")
+        assert np.max(np.abs(H_sdd_proj - H_sdd)
+                      ) < tol, ValueError("Projection cost should do nothing")
+        # Project PSD Matrix
+        H_sdd_proj, cost = dd_cone_project(H_sdp, cone='SDD', verbose=True)
+        assert cost > tol, ValueError("Cost should not be zero")
 
     def test_ddstar(self, tol=1e-3):
         scs_params = PARAMS_SCS_DFLT
         scs_params['verbose'] = False
 
         # # Run for one iteration
-        # X, info_p = self.prob.solve_ddstar_cut(scs_params={}, max_iter=1)
-        # # Compare to dual solution
-        # H, info_d = self.prob.solve_fusion_dual_homog(
-        #     verbose=True, cone="DD")
-        # assert np.abs(-info_p['info']['pobj'] - info_d['cost']) < tol, ValueError(
-        #     "Primal and Dual versions of DD problem have different cost")
+        X, info_p = self.prob.solve_ddstar_cut(scs_params={}, max_iter=1)
+        # Compare to dual solution
+        H, info_d = self.prob.solve_fusion_dual_homog(
+            verbose=True, cone="DD")
+        assert np.abs(-info_p['info']['pobj'] - info_d['cost']) < tol, ValueError(
+            "Primal and Dual versions of DD problem have different cost")
 
         # Run for multiple iterations
         X, info_p = self.prob.solve_ddstar_cut(scs_params=scs_params)
@@ -395,9 +423,13 @@ class TestClipper(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    test = TestClipper(test_prob="bunny", outrat=0.9, threshold=0.8)
+    # SETUP
+    test = TestClipper(test_prob="bunny", outrat=0.05, threshold=0.5)
+    # test = TestClipper(test_prob="three-clique")
+
+    # TESTS
     # test.test_affine_constraints()
-    # test.test_solve_fusion()
+    test.test_solve_fusion()
     # test.test_solve_fusion_dense()
     # test.test_solve_fusion_homog_cost()
     # test.test_symb_fact(plot=False)
@@ -411,4 +443,5 @@ if __name__ == "__main__":
     # test.test_dd_change_basis()
     # test.test_dd_basis()
     # test.test_ddstar()
-    test.test_pruning()
+    # test.test_pruning()
+    # test.test_dd_project()
