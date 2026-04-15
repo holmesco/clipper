@@ -1,0 +1,24 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "pybind11>=2.9.2",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "clipperpy"
+version = "0.2.4"
+description = "Python bindings for CLIPPER"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[tool.scikit-build]
+cmake.version = ">=3.18"
+
+[tool.scikit-build.cmake.define]
+CLIPPER_BUILD_BINDINGS_PYTHON = "ON"
+CLIPPER_BUILD_BINDINGS_MATLAB = "OFF"
+CLIPPER_BUILD_TESTS = "OFF"
+CLIPPER_BUILD_BENCHMARKS = "OFF"
+CLIPPER_ENABLE_MAXCLIQUE = "OFF"
+CLIPPER_ENABLE_SCS_SDR = "OFF"
