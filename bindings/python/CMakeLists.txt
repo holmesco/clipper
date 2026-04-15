@@ -14,6 +14,13 @@ file(WRITE "${PYPKG_DIR}/__init__.py"
     "from .clipperpy import __version__\n"
     "from .clipperpy import __doc__")
 
+install(TARGETS py_clipper
+    LIBRARY DESTINATION clipperpy
+    ARCHIVE DESTINATION clipperpy
+    RUNTIME DESTINATION clipperpy)
+install(FILES "${PYPKG_DIR}/__init__.py"
+    DESTINATION clipperpy)
+
 set(DIST "none")
 if(UNIX AND NOT APPLE)
     execute_process(COMMAND bash -c "lsb_release -cs" OUTPUT_VARIABLE UBUNTU_DIST)
