@@ -4,6 +4,9 @@ pybind11_add_module(py_clipper py_clipper.cpp)
 target_link_libraries(py_clipper PUBLIC clipper)
 set_target_properties(py_clipper PROPERTIES OUTPUT_NAME "clipperpy")
 set_target_properties(py_clipper PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${PYPKG_DIR}")
+set_target_properties(py_clipper PROPERTIES
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN")
 
 # copy setup.py file binary dir for install with: pip install .
 configure_file(setup.py.in ${CMAKE_CURRENT_BINARY_DIR}/setup.py)
