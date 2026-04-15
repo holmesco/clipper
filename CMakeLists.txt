@@ -64,11 +64,15 @@ if(CLIPPER_ENABLE_BLAS)
 endif()
 
 if(CLIPPER_BUILD_BINDINGS_PYTHON)
-  FetchContent_Declare(pybind11
-    GIT_REPOSITORY https://github.com/pybind/pybind11
-    GIT_TAG        v2.9.2
-  )
-  FetchContent_MakeAvailable(pybind11)
+    # Prefer an already-installed pybind11 (e.g., from Python build env).
+    find_package(pybind11 CONFIG QUIET)
+    if(NOT pybind11_FOUND)
+        FetchContent_Declare(pybind11
+            GIT_REPOSITORY https://github.com/pybind/pybind11
+            GIT_TAG        v2.13.6
+        )
+        FetchContent_MakeAvailable(pybind11)
+    endif()
 endif()
 
 if(CLIPPER_ENABLE_MAXCLIQUE)
@@ -158,10 +162,16 @@ endif()
 include(GNUInstallDirs)
 set(INSTALL_CONFIGDIR ${CMAKE_INSTALL_LIBDIR}/cmake/clipper)
 
+set(CLIPPER_LIBRARY_INSTALL_DIR ${CMAKE_INSTALL_LIBDIR})
+if(CLIPPER_BUILD_BINDINGS_PYTHON)
+    # For Python packaging, place libclipper next to the extension module.
+    set(CLIPPER_LIBRARY_INSTALL_DIR clipperpy)
+endif()
+
 install(TARGETS clipper
     EXPORT clipper-targets
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    LIBRARY DESTINATION ${CLIPPER_LIBRARY_INSTALL_DIR}
+    ARCHIVE DESTINATION ${CLIPPER_LIBRARY_INSTALL_DIR})
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
