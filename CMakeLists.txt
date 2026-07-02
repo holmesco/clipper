@@ -110,7 +110,9 @@ target_include_directories(clipper PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
 target_compile_options(clipper PUBLIC -march=native -mavx -mfma)
 set_target_properties(clipper PROPERTIES
-  VERSION ${PROJECT_VERSION})
+  VERSION ${PROJECT_VERSION}
+  BUILD_RPATH "$ORIGIN"
+  INSTALL_RPATH "$ORIGIN")
 target_compile_definitions(clipper PUBLIC CLIPPER_VERSION="${PROJECT_VERSION}")
 
 if(MKL_FOUND)
@@ -172,6 +174,13 @@ install(TARGETS clipper
     EXPORT clipper-targets
     LIBRARY DESTINATION ${CLIPPER_LIBRARY_INSTALL_DIR}
     ARCHIVE DESTINATION ${CLIPPER_LIBRARY_INSTALL_DIR})
+
+if(CLIPPER_ENABLE_MAXCLIQUE)
+    # Install libpmc alongside libclipper so it is found at runtime via $ORIGIN.
+    install(TARGETS pmc
+        LIBRARY DESTINATION ${CLIPPER_LIBRARY_INSTALL_DIR}
+        ARCHIVE DESTINATION ${CLIPPER_LIBRARY_INSTALL_DIR})
+endif()
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
